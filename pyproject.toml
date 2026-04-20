@@ -1,0 +1,12 @@
+[project]
+name = "ducketl"
+version = "0.1.0"
+description = "A lightweight ETL platform powered by DuckDB + DuckLake"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "duckdb>=1.0.0",
+    "requests>=2.31.0",
+    "pandas>=2.0.0",
+    "schedule>=1.2.2",
+]

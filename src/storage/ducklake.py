@@ -89,11 +89,7 @@ class DuckLakeStorage:
 
     def list_datasets(self) -> list:
         """List all datasets in the catalog."""
-        return (
-            self.catalog_conn.execute("""
+        return self.catalog_conn.execute("""
             SELECT name, layer, row_count, created_at, pipeline
             FROM catalog ORDER BY created_at DESC
-        """)
-            .fetchdf()
-            .to_dict("records")
-        )
+        """).fetchdf().to_dict("records")
