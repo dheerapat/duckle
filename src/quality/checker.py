@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from typing import List
 
 import duckdb
+from utils.sql_safety import safe_identifier
 
 
 @dataclass
@@ -21,9 +22,10 @@ class QualityChecker:
     def check(self, table: str, rules: List[QualityRule]) -> dict:
         results = []
         all_passed = True
+        safe_table = safe_identifier(table, label="table")
 
         for rule in rules:
-            sql = rule.sql.replace("{{table}}", table)
+            sql = rule.sql.replace("{{table}}", safe_table)
             row = self.conn.execute(sql).fetchone()
             passed = bool(row[0]) if row else False
 
@@ -45,35 +47,46 @@ class QualityChecker:
 
 
 # --- Built-in common rules ---
+# Column names are validated against a safe identifier pattern to prevent
+# SQL injection through user-supplied column names.
+
+
+def _col(name: str) -> str:
+    return safe_identifier(name, label="column")
 
 
 def no_nulls(column: str) -> QualityRule:
+    c = _col(column)
     return QualityRule(
-        name=f"no_nulls_{column}",
-        sql=f"SELECT COUNT(*) = 0 AS passed FROM {{{{table}}}} WHERE {column} IS NULL",
+        name=f"no_nulls_{c}",
+        sql=f"SELECT COUNT(*) = 0 AS passed FROM {{{{table}}}} WHERE {c} IS NULL",
         description=f"No nulls in column '{column}'",
     )
 
 
 def min_row_count(n: int) -> QualityRule:
+    if not isinstance(n, int) or n < 0:
+        raise ValueError("min_row_count requires a non-negative integer")
     return QualityRule(
         name="min_row_count",
-        sql=f"SELECT COUNT(*) >= {n} AS passed FROM {{{{table}}}}",
+        sql=f"SELECT COUNT(*) >= {int(n)} AS passed FROM {{{{table}}}}",
         description=f"At least {n} rows expected",
     )
 
 
 def column_positive(column: str) -> QualityRule:
+    c = _col(column)
     return QualityRule(
-        name=f"{column}_positive",
-        sql=f"SELECT MIN({column}) > 0 AS passed FROM {{{{table}}}}",
+        name=f"{c}_positive",
+        sql=f"SELECT MIN({c}) > 0 AS passed FROM {{{{table}}}}",
         description=f"All values in '{column}' must be positive",
     )
 
 
 def unique_column(column: str) -> QualityRule:
+    c = _col(column)
     return QualityRule(
-        name=f"{column}_unique",
-        sql=f"SELECT COUNT(*) = COUNT(DISTINCT {column}) AS passed FROM {{{{table}}}}",
+        name=f"{c}_unique",
+        sql=f"SELECT COUNT(*) = COUNT(DISTINCT {c}) AS passed FROM {{{{table}}}}",
         description=f"All values in '{column}' must be unique",
     )

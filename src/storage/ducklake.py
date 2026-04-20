@@ -1,36 +1,88 @@
+"""
+DuckLake-backed storage for DuckETL.
+
+Uses the official `ducklake` extension with a local DuckDB file as the
+metadata catalog.  All data is automatically stored as Parquet files
+managed by DuckLake (supports time-travel, updates, deletes, etc.).
+
+Bronze / Silver / Gold layers are implemented as DuckLake schemas.
+"""
 import os
-from datetime import datetime
+import tempfile
+from datetime import datetime, timezone
+from typing import Optional
 
 import duckdb
+from utils.sql_safety import safe_identifier
 
 
 class DuckLakeStorage:
     """
-    Persist DuckDB tables as Parquet files with a lightweight catalog.
-    Supports Bronze / Silver / Gold layers.
+    Persist data using the DuckLake extension with a local DuckDB catalog.
+    Data is stored as Parquet files managed by DuckLake automatically.
+    Supports Bronze / Silver / Gold layers as schemas.
     """
 
     LAYERS = ["bronze", "silver", "gold"]
 
     def __init__(self, base_path: str = "./lake"):
         self.base_path = base_path
-        self._init_catalog()
+        self.conn: duckdb.DuckDBPyConnection
+        self._meta_conn: duckdb.DuckDBPyConnection
+        self._ensure_base_path()
+        self._init_ducklake()
 
-    def _init_catalog(self):
-        """Create catalog DB to track all stored datasets."""
+    # ------------------------------------------------------------------
+    # Initialisation
+    # ------------------------------------------------------------------
+
+    def _ensure_base_path(self):
+        """Ensure the base directory exists (DuckLake ATTACH requires it)."""
         os.makedirs(self.base_path, exist_ok=True)
-        self.catalog_conn = duckdb.connect(f"{self.base_path}/_catalog.db")
-        self.catalog_conn.execute("""
-            CREATE TABLE IF NOT EXISTS catalog (
+
+    def _init_ducklake(self):
+        """
+        Create or attach the DuckLake database.
+
+        • Catalog file : <base_path>/ducklake.ducklake
+        • Data files   : <base_path>/ducklake.ducklake.files/  (Parquet)
+        """
+        catalog_path = os.path.join(self.base_path, "ducklake.ducklake")
+
+        conn = duckdb.connect()
+        conn.execute("INSTALL ducklake")
+        conn.execute("LOAD ducklake")
+        conn.execute(
+            f"ATTACH 'ducklake:{catalog_path}' AS ducklake"
+        )
+        conn.execute("USE ducklake")
+
+        # Create layer schemas
+        for layer in self.LAYERS:
+            conn.execute(f"CREATE SCHEMA IF NOT EXISTS {layer}")
+
+        # Lightweight metadata table for pipeline-level info
+        # (DuckLake itself does not track arbitrary metadata like pipeline name)
+        # Stored in a separate DuckDB file because DuckLake tables don't support PKs
+        metadata_file = os.path.join(self.base_path, "_metadata.db")
+        meta_conn = duckdb.connect(metadata_file)
+        meta_conn.execute("""
+            CREATE TABLE IF NOT EXISTS _metadata (
                 id          VARCHAR PRIMARY KEY,
                 name        VARCHAR,
                 layer       VARCHAR,
-                path        VARCHAR,
                 row_count   INTEGER,
                 created_at  TIMESTAMP,
                 pipeline    VARCHAR
             )
         """)
+
+        self.conn = conn
+        self._meta_conn = meta_conn
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
 
     def write(
         self,
@@ -38,58 +90,86 @@ class DuckLakeStorage:
         table: str,
         name: str,
         layer: str = "gold",
-        pipeline: str = None,
+        pipeline: Optional[str] = None,
     ) -> str:
-        """Write a DuckDB table to Parquet and register in catalog."""
+        """
+        Write a DuckDB table into the DuckLake layer.
+
+        The source ``conn`` is a *separate* DuckDB connection, so we
+        export its table to a temporary Parquet file and let DuckLake
+        ingest it natively via ``CREATE TABLE … AS SELECT * FROM
+        read_parquet(…)``.
+        """
         assert layer in self.LAYERS, f"Layer must be one of {self.LAYERS}"
 
-        layer_path = os.path.join(self.base_path, layer)
-        os.makedirs(layer_path, exist_ok=True)
+        table = safe_identifier(table, label="table")
+        safe_name = safe_identifier(name, label="dataset name")
 
-        ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-        file_path = os.path.join(layer_path, f"{name}_{ts}.parquet")
+        # Export source table → temp Parquet → DuckLake table
+        with tempfile.NamedTemporaryFile(suffix=".parquet", delete=True) as tmp:
+            conn.execute(f"COPY {table} TO '{tmp.name}' (FORMAT PARQUET)")
+            result = conn.execute(
+                f"SELECT COUNT(*) FROM {table}"
+            ).fetchone()
+            count = result[0] if result is not None else 0
 
-        conn.execute(f"COPY {table} TO '{file_path}' (FORMAT PARQUET)")
-        count = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            self.conn.execute(
+                f"CREATE OR REPLACE TABLE {layer}.{safe_name} "
+                f"AS SELECT * FROM read_parquet('{tmp.name}')"
+            )
 
-        self.catalog_conn.execute(
+        now = datetime.now(timezone.utc)
+        self._meta_conn.execute(
             """
-            INSERT OR REPLACE INTO catalog VALUES (?, ?, ?, ?, ?, ?, ?)
-        """,
-            [
-                f"{layer}/{name}",
-                name,
-                layer,
-                file_path,
-                count,
-                datetime.utcnow(),
-                pipeline,
-            ],
+            INSERT OR REPLACE INTO _metadata
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            [f"{layer}/{safe_name}", safe_name, layer, count, now, pipeline],
         )
+        self._meta_conn.commit()
 
-        print(f"[DuckLake] Written {count} rows → {file_path}")
-        return file_path
+        print(f"[DuckLake] Written {count} rows → {layer}.{safe_name}")
+        return f"{layer}.{safe_name}"
 
     def read(self, name: str, layer: str = "gold") -> duckdb.DuckDBPyRelation:
-        """Read the latest Parquet file for a dataset."""
-        row = self.catalog_conn.execute(
-            """
-            SELECT path FROM catalog
-            WHERE name = ? AND layer = ?
-            ORDER BY created_at DESC LIMIT 1
-        """,
-            [name, layer],
-        ).fetchone()
+        """Read a dataset from the DuckLake layer."""
+        if layer not in self.LAYERS:
+            raise ValueError(f"Layer must be one of {self.LAYERS}")
 
-        if not row:
-            raise FileNotFoundError(f"Dataset '{layer}/{name}' not found in catalog.")
+        safe_name = safe_identifier(name, label="dataset name")
+        return self.conn.table(f"{layer}.{safe_name}")
 
-        conn = duckdb.connect()
-        return conn.execute(f"SELECT * FROM read_parquet('{row[0]}')")
-
-    def list_datasets(self) -> list:
-        """List all datasets in the catalog."""
-        return self.catalog_conn.execute("""
+    def list_datasets(self) -> list[dict]:
+        """List all datasets registered in the metadata catalog."""
+        return self._meta_conn.execute("""
             SELECT name, layer, row_count, created_at, pipeline
-            FROM catalog ORDER BY created_at DESC
+            FROM _metadata
+            ORDER BY created_at DESC
         """).fetchdf().to_dict("records")
+
+    def snapshots(self) -> list[dict]:
+        """Return all DuckLake snapshots for the catalog (time-travel history)."""
+        return self.conn.execute(
+            "FROM ducklake.snapshots()"
+        ).fetchdf().to_dict("records")
+
+    def read_at_version(
+        self, name: str, layer: str = "gold", version: int = 0
+    ) -> duckdb.DuckDBPyRelation:
+        """Read a dataset at a specific DuckLake snapshot version."""
+        if layer not in self.LAYERS:
+            raise ValueError(f"Layer must be one of {self.LAYERS}")
+        safe_name = safe_identifier(name, label="dataset name")
+        return self.conn.query(
+            f"SELECT * FROM {layer}.{safe_name} AT (VERSION => {version})"
+        )
+
+    def close(self):
+        """Close all connections."""
+        if hasattr(self, "_meta_conn"):
+            self._meta_conn.close()
+        if hasattr(self, "conn"):
+            self.conn.close()
+
+    def __del__(self):
+        self.close()

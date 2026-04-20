@@ -1,5 +1,5 @@
 import traceback
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Optional
 
 import duckdb
@@ -18,7 +18,7 @@ class Pipeline:
         transforms: List[str],
         destination_name: str,
         destination_layer: str = "gold",
-        quality_rules: List[QualityRule] = None,
+        quality_rules: Optional[List[QualityRule]] = None,
     ):
         self.name = name
         self.source = source
@@ -29,14 +29,14 @@ class Pipeline:
 
 
 class PipelineRunner:
-    def __init__(self, storage: DuckLakeStorage = None):
+    def __init__(self, storage: Optional[DuckLakeStorage] = None):
         self.storage = storage or DuckLakeStorage()
         self.run_history = []
 
     def run(self, pipeline: Pipeline) -> dict:
         run = {
             "pipeline": pipeline.name,
-            "started_at": datetime.utcnow().isoformat(),
+            "started_at": datetime.now(timezone.utc).isoformat(),
             "status": "running",
             "error": None,
         }
@@ -84,6 +84,6 @@ class PipelineRunner:
             print(f"\n❌ Pipeline '{pipeline.name}' failed: {e}")
             traceback.print_exc()
 
-        run["finished_at"] = datetime.utcnow().isoformat()
+        run["finished_at"] = datetime.now(timezone.utc).isoformat()
         self.run_history.append(run)
         return run

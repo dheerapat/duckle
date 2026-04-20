@@ -63,6 +63,6 @@ for k, v in result.items():
 
 # --- Preview the output ---
 print("\n--- Preview gold/daily_revenue ---")
-storage = DuckLakeStorage("./lake")
-rel = storage.read("daily_revenue", "gold")
+rel = runner.storage.read("daily_revenue", "gold")
 print(rel.fetchdf().to_string(index=False))
+runner.storage.close()
