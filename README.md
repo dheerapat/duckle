@@ -1,4 +1,4 @@
-# DuckETL 🦆
+# Duckle 🦆
 
 A lightweight ETL platform for small companies, powered by DuckDB + DuckLake.
 
@@ -16,12 +16,6 @@ orchestrator/ → Schedule & run pipelines
 quality/      → Data quality checks
 api/          → FastAPI REST layer
 ui/           → React dashboard (coming soon)
-```
-
-## Quickstart
-```bash
-pip install -r requirements.txt
-python -m api.main
 ```
 
 ## Example Pipeline
