@@ -1,5 +1,5 @@
 [project]
-name = "ducketl"
+name = "duckle"
 version = "0.1.0"
 description = "A lightweight ETL platform powered by DuckDB + DuckLake"
 readme = "README.md"
