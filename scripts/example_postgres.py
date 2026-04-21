@@ -7,11 +7,13 @@ a multi-layer ETL pipeline:
 
     Postgres  →  bronze (raw staging)  →  silver (cleaned / enriched)  →  gold (aggregated)
 
+All pipelines are orchestrated through Pipeline / PipelineRunner.
+
 Prerequisites:
     docker compose up -d       # start the seeded restaurant database
 
 Usage:
-    python scripts/test_postgres.py
+    python scripts/example_postgres.py
 """
 
 import os
@@ -22,9 +24,9 @@ import time
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from connectors.postgres_connector import PostgresConnector
-from engine.transformer import Transformer
+from connectors.table_connector import TableConnector
 from orchestrator.runner import Pipeline, PipelineRunner
-from quality.checker import QualityChecker, column_positive, min_row_count, no_nulls, unique_column
+from quality.checker import column_positive, min_row_count, no_nulls, unique_column
 from storage.ducklake import DuckLakeStorage
 
 # ── Config ────────────────────────────────────────────────────────────
@@ -56,20 +58,18 @@ def _create_staging(conn, sql: str, table_name: str) -> str:
     return table_name
 
 
-def _extract_to_bronze(storage: DuckLakeStorage, query: str, name: str) -> None:
-    """Extract from Postgres into the bronze layer."""
-    conn = storage.conn
-    connector = PostgresConnector(PG_CONN, query)
-    connector.extract(conn, "raw")
-    storage.write("raw", name=name, layer="bronze", pipeline="pg_bronze_ingest")
-    conn.execute("DROP TABLE IF EXISTS raw")
+def _run_pipeline(runner: PipelineRunner, pipeline: Pipeline) -> dict:
+    """Run a pipeline, assert success, and return the result."""
+    result = runner.run(pipeline)
+    assert result["status"] == "success", f"Pipeline '{pipeline.name}' failed: {result['error']}"
+    return result
 
 
 # ── Bronze layer ─────────────────────────────────────────────────────
 
 
 def test_bronze_ingest() -> DuckLakeStorage:
-    """Ingest all restaurant tables into the bronze layer."""
+    """Ingest all restaurant tables into the bronze layer via PipelineRunner."""
     print("\n" + "=" * 60)
     print("STEP 1 — Bronze: raw ingest from Postgres")
     print("=" * 60)
@@ -78,14 +78,27 @@ def test_bronze_ingest() -> DuckLakeStorage:
         shutil.rmtree(LAKE_DIR)
 
     storage = DuckLakeStorage(base_path=LAKE_DIR)
+    runner = PipelineRunner(storage=storage)
 
-    _extract_to_bronze(storage, "SELECT * FROM menu_items", "menu_items")
-    _extract_to_bronze(storage, "SELECT * FROM customers", "customers")
-    _extract_to_bronze(storage, "SELECT * FROM orders", "orders")
-    _extract_to_bronze(storage, "SELECT * FROM order_items", "order_items")
+    tables = {
+        "menu_items":  "SELECT * FROM menu_items",
+        "customers":   "SELECT * FROM customers",
+        "orders":       "SELECT * FROM orders",
+        "order_items":  "SELECT * FROM order_items",
+    }
+
+    for name, query in tables.items():
+        pipeline = Pipeline(
+            name=f"pg_bronze_{name}",
+            source=PostgresConnector(PG_CONN, query),
+            transforms=["SELECT * FROM {{input}}"],
+            destination_name=name,
+            destination_layer="bronze",
+        )
+        _run_pipeline(runner, pipeline)
 
     print("\n  Bronze datasets:")
-    for name in ["menu_items", "customers", "orders", "order_items"]:
+    for name in tables:
         df = storage.read(name, "bronze").fetchdf()
         print(f"    bronze.{name}: {len(df)} rows  columns={list(df.columns)}")
 
@@ -102,73 +115,73 @@ def test_silver_clean(storage: DuckLakeStorage) -> None:
     print("STEP 2 — Silver: clean & validate")
     print("=" * 60)
 
+    runner = PipelineRunner(storage=storage)
     conn = storage.conn
-    transformer = Transformer(conn)
-    checker = QualityChecker(conn)
 
     # ── menu_items: dedupe, compute margin ────────────────────────────
     print("\n  → menu_items")
-    conn.execute("CREATE OR REPLACE TABLE stg__menu_items AS SELECT * FROM bronze.menu_items")
-    silver_menu = transformer.run([
-        """
-        SELECT DISTINCT id AS menu_item_id, name, category, price,
-               ROUND(price * 0.35, 2) AS estimated_cost,
-               ROUND(price * 0.65, 2) AS estimated_margin
-        FROM {{input}}
-        WHERE price > 0
-        """,
-    ], source_table="stg__menu_items")
-    result = checker.check(silver_menu, [
-        no_nulls("menu_item_id"), unique_column("menu_item_id"),
-        column_positive("price"),
-    ])
-    assert result["passed"], "Silver menu_items quality check failed"
-    storage.write(silver_menu, name="menu_items", layer="silver", pipeline="pg_silver_clean")
-    conn.execute("DROP TABLE IF EXISTS stg__menu_items")
-    conn.execute("DROP TABLE IF EXISTS _transform_step_0")
+    pipeline = Pipeline(
+        name="pg_silver_menu_items",
+        source=TableConnector("bronze.menu_items"),
+        transforms=[
+            """
+            SELECT DISTINCT id AS menu_item_id, name, category, price,
+                   ROUND(price * 0.35, 2) AS estimated_cost,
+                   ROUND(price * 0.65, 2) AS estimated_margin
+            FROM {{input}}
+            WHERE price > 0
+            """,
+        ],
+        destination_name="menu_items",
+        destination_layer="silver",
+        quality_rules=[no_nulls("menu_item_id"), unique_column("menu_item_id"), column_positive("price")],
+    )
+    _run_pipeline(runner, pipeline)
 
     # ── customers: dedupe, validate ──────────────────────────────────
     print("  → customers")
-    conn.execute("CREATE OR REPLACE TABLE stg__customers AS SELECT * FROM bronze.customers")
-    silver_customers = transformer.run([
-        """
-        SELECT DISTINCT id AS customer_id, name, email, phone,
-               joined_at, EXTRACT(MONTH FROM joined_at) AS join_month
-        FROM {{input}}
-        WHERE email IS NOT NULL
-        """,
-    ], source_table="stg__customers")
-    result = checker.check(silver_customers, [
-        no_nulls("customer_id"), no_nulls("email"),
-        unique_column("email"), min_row_count(30),
-    ])
-    assert result["passed"], "Silver customers quality check failed"
-    storage.write(silver_customers, name="customers", layer="silver", pipeline="pg_silver_clean")
-    conn.execute("DROP TABLE IF EXISTS stg__customers")
-    conn.execute("DROP TABLE IF EXISTS _transform_step_0")
+    pipeline = Pipeline(
+        name="pg_silver_customers",
+        source=TableConnector("bronze.customers"),
+        transforms=[
+            """
+            SELECT DISTINCT id AS customer_id, name, email, phone,
+                   joined_at, EXTRACT(MONTH FROM joined_at) AS join_month
+            FROM {{input}}
+            WHERE email IS NOT NULL
+            """,
+        ],
+        destination_name="customers",
+        destination_layer="silver",
+        quality_rules=[no_nulls("customer_id"), no_nulls("email"),
+                       unique_column("email"), min_row_count(30)],
+    )
+    _run_pipeline(runner, pipeline)
 
     # ── orders: dedupe, validate dates ────────────────────────────────
     print("  → orders")
-    conn.execute("CREATE OR REPLACE TABLE stg__orders AS SELECT * FROM bronze.orders")
-    silver_orders = transformer.run([
-        """
-        SELECT DISTINCT id AS order_id, order_date, customer_id,
-               EXTRACT(DOW FROM order_date) AS day_of_week,
-               CASE WHEN EXTRACT(DOW FROM order_date) IN (0, 6) THEN TRUE ELSE FALSE END AS is_weekend
-        FROM {{input}}
-        WHERE order_date IS NOT NULL
-        """,
-    ], source_table="stg__orders")
-    result = checker.check(silver_orders, [
-        no_nulls("order_id"), no_nulls("order_date"),
-        unique_column("order_id"), min_row_count(100),
-    ])
-    assert result["passed"], "Silver orders quality check failed"
-    storage.write(silver_orders, name="orders", layer="silver", pipeline="pg_silver_clean")
-    conn.execute("DROP TABLE IF EXISTS stg__orders")
-    conn.execute("DROP TABLE IF EXISTS _transform_step_0")
+    pipeline = Pipeline(
+        name="pg_silver_orders",
+        source=TableConnector("bronze.orders"),
+        transforms=[
+            """
+            SELECT DISTINCT id AS order_id, order_date, customer_id,
+                   EXTRACT(DOW FROM order_date) AS day_of_week,
+                   CASE WHEN EXTRACT(DOW FROM order_date) IN (0, 6) THEN TRUE ELSE FALSE END AS is_weekend
+            FROM {{input}}
+            WHERE order_date IS NOT NULL
+            """,
+        ],
+        destination_name="orders",
+        destination_layer="silver",
+        quality_rules=[no_nulls("order_id"), no_nulls("order_date"),
+                       unique_column("order_id"), min_row_count(100)],
+    )
+    _run_pipeline(runner, pipeline)
 
     # ── order_items: enrich with price from silver.menu_items ─────────
+    # This requires a JOIN across schemas, so we stage the join result
+    # then feed it through PipelineRunner for the quality check + write.
     print("  → order_items")
     _create_staging(conn, """
         SELECT
@@ -182,14 +195,17 @@ def test_silver_clean(storage: DuckLakeStorage) -> None:
         JOIN silver.menu_items AS m ON oi.menu_item_id = m.menu_item_id
         WHERE oi.quantity > 0
     """, "stg__order_items")
-    result = checker.check("stg__order_items", [
-        no_nulls("order_item_id"), no_nulls("order_id"),
-        column_positive("quantity"), column_positive("line_total"),
-        min_row_count(100),
-    ])
-    assert result["passed"], "Silver order_items quality check failed"
-    storage.write("stg__order_items", name="order_items", layer="silver", pipeline="pg_silver_clean")
-    conn.execute("DROP TABLE IF EXISTS stg__order_items")
+    pipeline = Pipeline(
+        name="pg_silver_order_items",
+        source=TableConnector("stg__order_items"),
+        transforms=["SELECT * FROM {{input}}"],
+        destination_name="order_items",
+        destination_layer="silver",
+        quality_rules=[no_nulls("order_item_id"), no_nulls("order_id"),
+                       column_positive("quantity"), column_positive("line_total"),
+                       min_row_count(100)],
+    )
+    _run_pipeline(runner, pipeline)
 
     # Summary
     print("\n  Silver datasets:")
@@ -209,9 +225,8 @@ def test_gold_aggregates(storage: DuckLakeStorage) -> None:
     print("STEP 3 — Gold: aggregated insights")
     print("=" * 60)
 
+    runner = PipelineRunner(storage=storage)
     conn = storage.conn
-    transformer = Transformer(conn)
-    checker = QualityChecker(conn)
 
     # ── daily_category_revenue ─────────────────────────────────────────
     print("\n  → daily_category_revenue")
@@ -229,26 +244,27 @@ def test_gold_aggregates(storage: DuckLakeStorage) -> None:
         GROUP BY o.order_date, m.category
     """, "stg__dcr")
 
-    dcr = transformer.run([
-        """
-        SELECT *,
-            CASE
-                WHEN revenue >= 300 THEN 'high'
-                WHEN revenue >= 100 THEN 'medium'
-                ELSE 'low'
-            END AS revenue_tier,
-            ROUND(revenue / NULLIF(items_sold, 0), 2) AS avg_item_price
-        FROM {{input}}
-        """,
-    ], source_table="stg__dcr")
-    result = checker.check(dcr, [
-        no_nulls("order_date"), no_nulls("category"),
-        column_positive("revenue"), min_row_count(10),
-    ])
-    assert result["passed"], "Gold daily_category_revenue quality check failed"
-    storage.write(dcr, name="daily_category_revenue", layer="gold", pipeline="gold_daily_revenue")
-    conn.execute("DROP TABLE IF EXISTS stg__dcr")
-    conn.execute("DROP TABLE IF EXISTS _transform_step_0")
+    pipeline = Pipeline(
+        name="gold_daily_revenue",
+        source=TableConnector("stg__dcr"),
+        transforms=[
+            """
+            SELECT *,
+                CASE
+                    WHEN revenue >= 300 THEN 'high'
+                    WHEN revenue >= 100 THEN 'medium'
+                    ELSE 'low'
+                END AS revenue_tier,
+                ROUND(revenue / NULLIF(items_sold, 0), 2) AS avg_item_price
+            FROM {{input}}
+            """,
+        ],
+        destination_name="daily_category_revenue",
+        destination_layer="gold",
+        quality_rules=[no_nulls("order_date"), no_nulls("category"),
+                       column_positive("revenue"), min_row_count(10)],
+    )
+    _run_pipeline(runner, pipeline)
 
     # ── customer_spending (lifetime value) ────────────────────────────
     print("  → customer_spending")
@@ -270,30 +286,31 @@ def test_gold_aggregates(storage: DuckLakeStorage) -> None:
         GROUP BY c.customer_id, c.name, c.email, c.joined_at
     """, "stg__cs")
 
-    cs = transformer.run([
-        """
-        SELECT *,
-            CASE
-                WHEN total_spent >= 500 THEN 'platinum'
-                WHEN total_spent >= 200 THEN 'gold'
-                WHEN total_spent >= 50  THEN 'silver'
-                ELSE 'bronze'
-            END AS loyalty_tier,
-            CASE
-                WHEN active_days > 90 THEN 'loyal'
-                WHEN active_days > 30 THEN 'regular'
-                ELSE 'new'
-            END AS customer_segment
-        FROM {{input}}
-        """,
-    ], source_table="stg__cs")
-    result = checker.check(cs, [
-        no_nulls("customer_id"), unique_column("customer_id"), min_row_count(10),
-    ])
-    assert result["passed"], "Gold customer_spending quality check failed"
-    storage.write(cs, name="customer_spending", layer="gold", pipeline="gold_customer_spending")
-    conn.execute("DROP TABLE IF EXISTS stg__cs")
-    conn.execute("DROP TABLE IF EXISTS _transform_step_0")
+    pipeline = Pipeline(
+        name="gold_customer_spending",
+        source=TableConnector("stg__cs"),
+        transforms=[
+            """
+            SELECT *,
+                CASE
+                    WHEN total_spent >= 500 THEN 'platinum'
+                    WHEN total_spent >= 200 THEN 'gold'
+                    WHEN total_spent >= 50  THEN 'silver'
+                    ELSE 'bronze'
+                END AS loyalty_tier,
+                CASE
+                    WHEN active_days > 90 THEN 'loyal'
+                    WHEN active_days > 30 THEN 'regular'
+                    ELSE 'new'
+                END AS customer_segment
+            FROM {{input}}
+            """,
+        ],
+        destination_name="customer_spending",
+        destination_layer="gold",
+        quality_rules=[no_nulls("customer_id"), unique_column("customer_id"), min_row_count(10)],
+    )
+    _run_pipeline(runner, pipeline)
 
     # ── menu_item_performance ─────────────────────────────────────────
     print("  → menu_item_performance")
@@ -311,26 +328,27 @@ def test_gold_aggregates(storage: DuckLakeStorage) -> None:
         GROUP BY m.menu_item_id, m.name, m.category, m.estimated_margin
     """, "stg__mip")
 
-    mip = transformer.run([
-        """
-        SELECT *,
-            ROUND(estimated_margin * total_sold, 2) AS total_margin,
-            CASE
-                WHEN total_sold >= 200 THEN 'top_seller'
-                WHEN total_sold >= 80  THEN 'steady'
-                ELSE 'slow_mover'
-            END AS sales_velocity
-        FROM {{input}}
-        """,
-    ], source_table="stg__mip")
-    result = checker.check(mip, [
-        no_nulls("menu_item_id"), unique_column("menu_item_id"),
-        column_positive("total_revenue"),
-    ])
-    assert result["passed"], "Gold menu_item_performance quality check failed"
-    storage.write(mip, name="menu_item_performance", layer="gold", pipeline="gold_menu_item_performance")
-    conn.execute("DROP TABLE IF EXISTS stg__mip")
-    conn.execute("DROP TABLE IF EXISTS _transform_step_0")
+    pipeline = Pipeline(
+        name="gold_menu_item_performance",
+        source=TableConnector("stg__mip"),
+        transforms=[
+            """
+            SELECT *,
+                ROUND(estimated_margin * total_sold, 2) AS total_margin,
+                CASE
+                    WHEN total_sold >= 200 THEN 'top_seller'
+                    WHEN total_sold >= 80  THEN 'steady'
+                    ELSE 'slow_mover'
+                END AS sales_velocity
+            FROM {{input}}
+            """,
+        ],
+        destination_name="menu_item_performance",
+        destination_layer="gold",
+        quality_rules=[no_nulls("menu_item_id"), unique_column("menu_item_id"),
+                       column_positive("total_revenue")],
+    )
+    _run_pipeline(runner, pipeline)
 
     # ── weekend_vs_weekday ─────────────────────────────────────────────
     print("  → weekend_vs_weekday")
@@ -347,21 +365,22 @@ def test_gold_aggregates(storage: DuckLakeStorage) -> None:
         GROUP BY o.is_weekend
     """, "stg__wvw")
 
-    wvw = transformer.run([
-        """
-        SELECT *,
-            ROUND(total_revenue / NULLIF(total_orders, 0), 2) AS revenue_per_order,
-            ROUND(total_items / NULLIF(total_orders, 0), 2)   AS items_per_order
-        FROM {{input}}
-        """,
-    ], source_table="stg__wvw")
-    result = checker.check(wvw, [
-        min_row_count(2),
-    ])
-    assert result["passed"], "Gold weekend_vs_weekday quality check failed"
-    storage.write(wvw, name="weekend_vs_weekday", layer="gold", pipeline="gold_weekend_vs_weekday")
-    conn.execute("DROP TABLE IF EXISTS stg__wvw")
-    conn.execute("DROP TABLE IF EXISTS _transform_step_0")
+    pipeline = Pipeline(
+        name="gold_weekend_vs_weekday",
+        source=TableConnector("stg__wvw"),
+        transforms=[
+            """
+            SELECT *,
+                ROUND(total_revenue / NULLIF(total_orders, 0), 2) AS revenue_per_order,
+                ROUND(total_items / NULLIF(total_orders, 0), 2)   AS items_per_order
+            FROM {{input}}
+            """,
+        ],
+        destination_name="weekend_vs_weekday",
+        destination_layer="gold",
+        quality_rules=[min_row_count(2)],
+    )
+    _run_pipeline(runner, pipeline)
 
     print("✅ Gold aggregates complete")
 

@@ -6,8 +6,10 @@ Generates realistic multi-file CSV data, then runs a multi-layer ETL pipeline:
 
     raw CSVs  →  bronze (staging)  →  silver (cleaned)  →  gold (aggregated)
 
+All pipelines are orchestrated through Pipeline / PipelineRunner.
+
 Usage:
-    python scripts/test_csv.py
+    python scripts/example_csv.py
 """
 
 import csv
@@ -20,8 +22,9 @@ from datetime import date, timedelta
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from connectors.csv_connector import CSVConnector
-from engine.transformer import Transformer
-from quality.checker import QualityChecker, QualityRule, column_positive, min_row_count, no_nulls, unique_column
+from connectors.table_connector import TableConnector
+from orchestrator.runner import Pipeline, PipelineRunner
+from quality.checker import QualityChecker, column_positive, min_row_count, no_nulls, unique_column
 from storage.ducklake import DuckLakeStorage
 
 # ── Paths ─────────────────────────────────────────────────────────────
@@ -133,11 +136,18 @@ def _create_staging(conn, sql: str, table_name: str) -> str:
     return table_name
 
 
+def _run_pipeline(runner: PipelineRunner, pipeline: Pipeline) -> dict:
+    """Run a pipeline, assert success, and return the result."""
+    result = runner.run(pipeline)
+    assert result["status"] == "success", f"Pipeline '{pipeline.name}' failed: {result['error']}"
+    return result
+
+
 # ── Bronze layer ─────────────────────────────────────────────────────
 
 
 def test_bronze_ingest(paths: dict[str, str]) -> DuckLakeStorage:
-    """Ingest all CSVs into the bronze layer (raw staging)."""
+    """Ingest all CSVs into the bronze layer (raw staging) via PipelineRunner."""
     print("\n" + "=" * 60)
     print("STEP 1 — Bronze: raw ingest")
     print("=" * 60)
@@ -146,13 +156,17 @@ def test_bronze_ingest(paths: dict[str, str]) -> DuckLakeStorage:
         shutil.rmtree(LAKE_DIR)
 
     storage = DuckLakeStorage(base_path=LAKE_DIR)
-    conn = storage.conn
+    runner = PipelineRunner(storage=storage)
 
     for name, path in paths.items():
-        connector = CSVConnector(path)
-        connector.extract(conn, "raw")
-        storage.write("raw", name=name, layer="bronze", pipeline="csv_bronze_ingest")
-        conn.execute("DROP TABLE IF EXISTS raw")
+        pipeline = Pipeline(
+            name=f"csv_bronze_{name}",
+            source=CSVConnector(path),
+            transforms=["SELECT * FROM {{input}}"],
+            destination_name=name,
+            destination_layer="bronze",
+        )
+        _run_pipeline(runner, pipeline)
 
     print("\n  Bronze datasets:")
     for name in paths:
@@ -172,51 +186,51 @@ def test_silver_clean(storage: DuckLakeStorage) -> None:
     print("STEP 2 — Silver: clean & validate")
     print("=" * 60)
 
+    runner = PipelineRunner(storage=storage)
     conn = storage.conn
-    transformer = Transformer(conn)
-    checker = QualityChecker(conn)
 
     # ── products: dedupe, filter, compute margin ──────────────────────
     print("\n  → products")
-    conn.execute("CREATE OR REPLACE TABLE stg__products AS SELECT * FROM bronze.products")
-    silver_products = transformer.run([
-        """
-        SELECT DISTINCT product_id, name, category,
-               cost, price, ROUND(price - cost, 2) AS margin
-        FROM {{input}}
-        WHERE product_id IS NOT NULL AND price > 0 AND cost > 0
-        """,
-    ], source_table="stg__products")
-    result = checker.check(silver_products, [
-        no_nulls("product_id"), unique_column("product_id"),
-        column_positive("price"), column_positive("cost"),
-    ])
-    assert result["passed"], "Silver products quality check failed"
-    storage.write(silver_products, name="products", layer="silver", pipeline="csv_silver_clean")
-    conn.execute("DROP TABLE IF EXISTS stg__products")
-    conn.execute("DROP TABLE IF EXISTS _transform_step_0")
+    pipeline = Pipeline(
+        name="csv_silver_products",
+        source=TableConnector("bronze.products"),
+        transforms=[
+            """
+            SELECT DISTINCT product_id, name, category,
+                   cost, price, ROUND(price - cost, 2) AS margin
+            FROM {{input}}
+            WHERE product_id IS NOT NULL AND price > 0 AND cost > 0
+            """,
+        ],
+        destination_name="products",
+        destination_layer="silver",
+        quality_rules=[no_nulls("product_id"), unique_column("product_id"),
+                       column_positive("price"), column_positive("cost")],
+    )
+    _run_pipeline(runner, pipeline)
 
     # ── customers: dedupe, cast date ──────────────────────────────────
     print("  → customers")
-    conn.execute("CREATE OR REPLACE TABLE stg__customers AS SELECT * FROM bronze.customers")
-    silver_customers = transformer.run([
-        """
-        SELECT DISTINCT customer_id, name, email, region,
-               CAST(joined_at AS DATE) AS joined_at
-        FROM {{input}}
-        WHERE customer_id IS NOT NULL AND email IS NOT NULL
-        """,
-    ], source_table="stg__customers")
-    result = checker.check(silver_customers, [
-        no_nulls("customer_id"), no_nulls("email"), unique_column("customer_id"),
-    ])
-    assert result["passed"], "Silver customers quality check failed"
-    storage.write(silver_customers, name="customers", layer="silver", pipeline="csv_silver_clean")
-    conn.execute("DROP TABLE IF EXISTS stg__customers")
-    conn.execute("DROP TABLE IF EXISTS _transform_step_0")
+    pipeline = Pipeline(
+        name="csv_silver_customers",
+        source=TableConnector("bronze.customers"),
+        transforms=[
+            """
+            SELECT DISTINCT customer_id, name, email, region,
+                   CAST(joined_at AS DATE) AS joined_at
+            FROM {{input}}
+            WHERE customer_id IS NOT NULL AND email IS NOT NULL
+            """,
+        ],
+        destination_name="customers",
+        destination_layer="silver",
+        quality_rules=[no_nulls("customer_id"), no_nulls("email"), unique_column("customer_id")],
+    )
+    _run_pipeline(runner, pipeline)
 
     # ── order_lines: enrich with price from silver.products ────────────
-    # This requires a JOIN across schemas, so we use direct SQL
+    # This requires a JOIN across schemas, so we stage the join result
+    # then feed it through PipelineRunner for the quality check + write.
     print("  → order_lines")
     _create_staging(conn, """
         SELECT
@@ -233,33 +247,36 @@ def test_silver_clean(storage: DuckLakeStorage) -> None:
         JOIN silver.products AS p ON ol.product_id = p.product_id
         WHERE ol.quantity > 0 AND ol.discount_pct >= 0 AND ol.discount_pct <= 100
     """, "stg__order_lines")
-    result = checker.check("stg__order_lines", [
-        no_nulls("line_id"), no_nulls("order_date"),
-        column_positive("net_amount"), min_row_count(100),
-    ])
-    assert result["passed"], "Silver order_lines quality check failed"
-    storage.write("stg__order_lines", name="order_lines", layer="silver", pipeline="csv_silver_clean")
-    conn.execute("DROP TABLE IF EXISTS stg__order_lines")
+    pipeline = Pipeline(
+        name="csv_silver_order_lines",
+        source=TableConnector("stg__order_lines"),
+        transforms=["SELECT * FROM {{input}}"],
+        destination_name="order_lines",
+        destination_layer="silver",
+        quality_rules=[no_nulls("line_id"), no_nulls("order_date"),
+                       column_positive("net_amount"), min_row_count(100)],
+    )
+    _run_pipeline(runner, pipeline)
 
     # ── returns: dedupe, filter, cast date ────────────────────────────
     print("  → returns")
-    conn.execute("CREATE OR REPLACE TABLE stg__returns AS SELECT * FROM bronze.returns")
-    silver_returns = transformer.run([
-        """
-        SELECT DISTINCT return_id, line_id,
-               CAST(return_date AS DATE) AS return_date,
-               reason, refund_amount
-        FROM {{input}}
-        WHERE refund_amount > 0
-        """,
-    ], source_table="stg__returns")
-    result = checker.check(silver_returns, [
-        no_nulls("return_id"), no_nulls("reason"), column_positive("refund_amount"),
-    ])
-    assert result["passed"], "Silver returns quality check failed"
-    storage.write(silver_returns, name="returns", layer="silver", pipeline="csv_silver_clean")
-    conn.execute("DROP TABLE IF EXISTS stg__returns")
-    conn.execute("DROP TABLE IF EXISTS _transform_step_0")
+    pipeline = Pipeline(
+        name="csv_silver_returns",
+        source=TableConnector("bronze.returns"),
+        transforms=[
+            """
+            SELECT DISTINCT return_id, line_id,
+                   CAST(return_date AS DATE) AS return_date,
+                   reason, refund_amount
+            FROM {{input}}
+            WHERE refund_amount > 0
+            """,
+        ],
+        destination_name="returns",
+        destination_layer="silver",
+        quality_rules=[no_nulls("return_id"), no_nulls("reason"), column_positive("refund_amount")],
+    )
+    _run_pipeline(runner, pipeline)
 
     # Summary
     print("\n  Silver datasets:")
@@ -279,9 +296,8 @@ def test_gold_aggregates(storage: DuckLakeStorage) -> None:
     print("STEP 3 — Gold: aggregated insights")
     print("=" * 60)
 
+    runner = PipelineRunner(storage=storage)
     conn = storage.conn
-    transformer = Transformer(conn)
-    checker = QualityChecker(conn)
 
     # ── daily_category_revenue ─────────────────────────────────────────
     print("\n  → daily_category_revenue")
@@ -298,26 +314,27 @@ def test_gold_aggregates(storage: DuckLakeStorage) -> None:
         GROUP BY ol.order_date, p.category
     """, "stg__dcr")
 
-    dcr = transformer.run([
-        """
-        SELECT *,
-            CASE
-                WHEN revenue >= 200 THEN 'high'
-                WHEN revenue >= 50  THEN 'medium'
-                ELSE 'low'
-            END AS revenue_tier,
-            ROUND(revenue / NULLIF(items_sold, 0), 2) AS avg_item_price
-        FROM {{input}}
-        """,
-    ], source_table="stg__dcr")
-    result = checker.check(dcr, [
-        no_nulls("order_date"), no_nulls("category"),
-        column_positive("revenue"), min_row_count(10),
-    ])
-    assert result["passed"], "Gold daily_category_revenue quality check failed"
-    storage.write(dcr, name="daily_category_revenue", layer="gold", pipeline="gold_daily_revenue")
-    conn.execute("DROP TABLE IF EXISTS stg__dcr")
-    conn.execute("DROP TABLE IF EXISTS _transform_step_0")
+    pipeline = Pipeline(
+        name="gold_daily_revenue",
+        source=TableConnector("stg__dcr"),
+        transforms=[
+            """
+            SELECT *,
+                CASE
+                    WHEN revenue >= 200 THEN 'high'
+                    WHEN revenue >= 50  THEN 'medium'
+                    ELSE 'low'
+                END AS revenue_tier,
+                ROUND(revenue / NULLIF(items_sold, 0), 2) AS avg_item_price
+            FROM {{input}}
+            """,
+        ],
+        destination_name="daily_category_revenue",
+        destination_layer="gold",
+        quality_rules=[no_nulls("order_date"), no_nulls("category"),
+                       column_positive("revenue"), min_row_count(10)],
+    )
+    _run_pipeline(runner, pipeline)
 
     # ── customer_lifetime_value ────────────────────────────────────────
     print("  → customer_lifetime_value")
@@ -337,30 +354,31 @@ def test_gold_aggregates(storage: DuckLakeStorage) -> None:
         GROUP BY c.customer_id, c.name, c.region
     """, "stg__clv")
 
-    clv = transformer.run([
-        """
-        SELECT *,
-            CASE
-                WHEN total_spent >= 500 THEN 'platinum'
-                WHEN total_spent >= 200 THEN 'gold'
-                WHEN total_spent >= 50  THEN 'silver'
-                ELSE 'bronze'
-            END AS loyalty_tier,
-            CASE
-                WHEN active_days > 30 THEN 'loyal'
-                WHEN active_days > 7  THEN 'regular'
-                ELSE 'new'
-            END AS customer_segment
-        FROM {{input}}
-        """,
-    ], source_table="stg__clv")
-    result = checker.check(clv, [
-        no_nulls("customer_id"), unique_column("customer_id"), min_row_count(10),
-    ])
-    assert result["passed"], "Gold customer_lifetime_value quality check failed"
-    storage.write(clv, name="customer_lifetime_value", layer="gold", pipeline="gold_customer_clv")
-    conn.execute("DROP TABLE IF EXISTS stg__clv")
-    conn.execute("DROP TABLE IF EXISTS _transform_step_0")
+    pipeline = Pipeline(
+        name="gold_customer_clv",
+        source=TableConnector("stg__clv"),
+        transforms=[
+            """
+            SELECT *,
+                CASE
+                    WHEN total_spent >= 500 THEN 'platinum'
+                    WHEN total_spent >= 200 THEN 'gold'
+                    WHEN total_spent >= 50  THEN 'silver'
+                    ELSE 'bronze'
+                END AS loyalty_tier,
+                CASE
+                    WHEN active_days > 30 THEN 'loyal'
+                    WHEN active_days > 7  THEN 'regular'
+                    ELSE 'new'
+                END AS customer_segment
+            FROM {{input}}
+            """,
+        ],
+        destination_name="customer_lifetime_value",
+        destination_layer="gold",
+        quality_rules=[no_nulls("customer_id"), unique_column("customer_id"), min_row_count(10)],
+    )
+    _run_pipeline(runner, pipeline)
 
     # ── product_performance ────────────────────────────────────────────
     print("  → product_performance")
@@ -379,25 +397,26 @@ def test_gold_aggregates(storage: DuckLakeStorage) -> None:
         GROUP BY p.product_id, p.name, p.category, p.margin
     """, "stg__pp")
 
-    pp = transformer.run([
-        """
-        SELECT *,
-            ROUND(total_margin / NULLIF(total_revenue, 0) * 100, 2) AS margin_pct,
-            CASE
-                WHEN total_sold >= 50  THEN 'top_seller'
-                WHEN total_sold >= 20  THEN 'steady'
-                ELSE 'slow_mover'
-            END AS sales_velocity
-        FROM {{input}}
-        """,
-    ], source_table="stg__pp")
-    result = checker.check(pp, [
-        no_nulls("product_id"), unique_column("product_id"), column_positive("total_revenue"),
-    ])
-    assert result["passed"], "Gold product_performance quality check failed"
-    storage.write(pp, name="product_performance", layer="gold", pipeline="gold_product_performance")
-    conn.execute("DROP TABLE IF EXISTS stg__pp")
-    conn.execute("DROP TABLE IF EXISTS _transform_step_0")
+    pipeline = Pipeline(
+        name="gold_product_performance",
+        source=TableConnector("stg__pp"),
+        transforms=[
+            """
+            SELECT *,
+                ROUND(total_margin / NULLIF(total_revenue, 0) * 100, 2) AS margin_pct,
+                CASE
+                    WHEN total_sold >= 50  THEN 'top_seller'
+                    WHEN total_sold >= 20  THEN 'steady'
+                    ELSE 'slow_mover'
+                END AS sales_velocity
+            FROM {{input}}
+            """,
+        ],
+        destination_name="product_performance",
+        destination_layer="gold",
+        quality_rules=[no_nulls("product_id"), unique_column("product_id"), column_positive("total_revenue")],
+    )
+    _run_pipeline(runner, pipeline)
 
     # ── regional_summary ───────────────────────────────────────────────
     print("  → regional_summary")
@@ -414,21 +433,22 @@ def test_gold_aggregates(storage: DuckLakeStorage) -> None:
         GROUP BY c.region
     """, "stg__rs")
 
-    rs = transformer.run([
-        """
-        SELECT *,
-            ROUND(total_revenue / NULLIF(customers, 0), 2) AS revenue_per_customer,
-            ROUND(total_items / NULLIF(customers, 0), 2)   AS items_per_customer
-        FROM {{input}}
-        """,
-    ], source_table="stg__rs")
-    result = checker.check(rs, [
-        no_nulls("region"), unique_column("region"), min_row_count(4),
-    ])
-    assert result["passed"], "Gold regional_summary quality check failed"
-    storage.write(rs, name="regional_summary", layer="gold", pipeline="gold_regional_summary")
-    conn.execute("DROP TABLE IF EXISTS stg__rs")
-    conn.execute("DROP TABLE IF EXISTS _transform_step_0")
+    pipeline = Pipeline(
+        name="gold_regional_summary",
+        source=TableConnector("stg__rs"),
+        transforms=[
+            """
+            SELECT *,
+                ROUND(total_revenue / NULLIF(customers, 0), 2) AS revenue_per_customer,
+                ROUND(total_items / NULLIF(customers, 0), 2)   AS items_per_customer
+            FROM {{input}}
+            """,
+        ],
+        destination_name="regional_summary",
+        destination_layer="gold",
+        quality_rules=[no_nulls("region"), unique_column("region"), min_row_count(4)],
+    )
+    _run_pipeline(runner, pipeline)
 
     print("✅ Gold aggregates complete")
 
