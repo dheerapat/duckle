@@ -42,6 +42,7 @@ class PipelineRunner:
         }
         print(f"\n🚀 Starting pipeline: {pipeline.name}")
 
+        conn = None
         try:
             conn = duckdb.connect()
 
@@ -83,6 +84,10 @@ class PipelineRunner:
             run["error"] = str(e)
             print(f"\n❌ Pipeline '{pipeline.name}' failed: {e}")
             traceback.print_exc()
+
+        finally:
+            if conn is not None:
+                conn.close()
 
         run["finished_at"] = datetime.now(timezone.utc).isoformat()
         self.run_history.append(run)
