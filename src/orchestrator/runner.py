@@ -2,7 +2,6 @@ import traceback
 from datetime import datetime, timezone
 from typing import List, Optional
 
-import duckdb
 from connectors.base import BaseConnector
 
 from engine.transformer import Transformer
@@ -42,18 +41,21 @@ class PipelineRunner:
         }
         print(f"\n🚀 Starting pipeline: {pipeline.name}")
 
-        conn = None
-        try:
-            conn = duckdb.connect()
+        conn = self.storage.conn
+        intermediate_tables: List[str] = []
 
+        try:
             # 1. EXTRACT
             print("\n[1/4] Extracting...")
             pipeline.source.extract(conn, "raw")
+            intermediate_tables.append("raw")
 
             # 2. TRANSFORM
             print("\n[2/4] Transforming...")
             transformer = Transformer(conn)
             final_table = transformer.run(pipeline.transforms, "raw")
+            for i in range(len(pipeline.transforms)):
+                intermediate_tables.append(f"_transform_step_{i}")
 
             # 3. QUALITY CHECKS
             if pipeline.quality_rules:
@@ -69,7 +71,6 @@ class PipelineRunner:
             # 4. LOAD
             print("\n[4/4] Loading to DuckLake...")
             self.storage.write(
-                conn,
                 final_table,
                 name=pipeline.destination_name,
                 layer=pipeline.destination_layer,
@@ -86,8 +87,12 @@ class PipelineRunner:
             traceback.print_exc()
 
         finally:
-            if conn is not None:
-                conn.close()
+            # Clean up intermediate tables from the shared connection
+            for table_name in intermediate_tables:
+                try:
+                    conn.execute(f"DROP TABLE IF EXISTS {table_name}")
+                except Exception:
+                    pass
 
         run["finished_at"] = datetime.now(timezone.utc).isoformat()
         self.run_history.append(run)

@@ -8,7 +8,6 @@ managed by DuckLake (supports time-travel, updates, deletes, etc.).
 Bronze / Silver / Gold layers are implemented as DuckLake schemas.
 """
 import os
-import tempfile
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -86,48 +85,37 @@ class DuckLakeStorage:
 
     def write(
         self,
-        conn: duckdb.DuckDBPyConnection,
         table: str,
         name: str,
         layer: str = "gold",
         pipeline: Optional[str] = None,
     ) -> str:
         """
-        Write a DuckDB table into the DuckLake layer.
+        Write a DuckDB table into a DuckLake layer.
 
-        The source ``conn`` is a *separate* DuckDB connection, so we
-        export its table to a temporary Parquet file and let DuckLake
-        ingest it natively via ``CREATE TABLE … AS SELECT * FROM
-        read_parquet(…)``.
+        Uses the shared DuckLake connection so no temp files or
+        cross-connection data transfer is needed — the table is
+        copied in-place via ``CREATE OR REPLACE TABLE … AS SELECT``.
+
+        The caller must ensure the source table exists in ``self.conn``
+        (e.g. the pipeline runner uses the same connection for extract,
+        transform, and load).
         """
         assert layer in self.LAYERS, f"Layer must be one of {self.LAYERS}"
 
         table = safe_identifier(table, label="table")
         safe_name = safe_identifier(name, label="dataset name")
 
-        # Export source table → temp Parquet → DuckLake table
-        # NOTE: COPY TO does not support parameterised file paths, so we
-        # use a fixed tempfile name rather than interpolating an arbitrary path.
-        tmp = tempfile.NamedTemporaryFile(suffix=".parquet", delete=False)
-        tmp_path = tmp.name
-        tmp.close()
-        try:
-            conn.execute(f"COPY {table} TO '{tmp_path}' (FORMAT PARQUET)")
-            result = conn.execute(
-                f"SELECT COUNT(*) FROM {table}"
-            ).fetchone()
-            count = result[0] if result is not None else 0
+        result = self.conn.execute(
+            f"SELECT COUNT(*) FROM {table}"
+        ).fetchone()
+        count = result[0] if result is not None else 0
 
-            # Use parameterised query for the file path to prevent injection
-            self.conn.execute(
-                f"CREATE OR REPLACE TABLE {layer}.{safe_name} "
-                "AS SELECT * FROM read_parquet(?)",
-                [tmp_path],
-            )
-        finally:
-            # Clean up the temp file
-            if os.path.exists(tmp_path):
-                os.unlink(tmp_path)
+        # Direct in-connection write — no temp file, no cross-connection copy
+        self.conn.execute(
+            f"CREATE OR REPLACE TABLE {layer}.{safe_name} "
+            f"AS SELECT * FROM {table}"
+        )
 
         now = datetime.now(timezone.utc)
         self._meta_conn.execute(

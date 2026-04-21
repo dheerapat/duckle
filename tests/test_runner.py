@@ -60,8 +60,8 @@ class TestPipelineRunner:
         assert result["status"] == "failed"
         assert "Quality checks failed" in result["error"]
 
-    def test_pipeline_closes_connection_on_success(self, ducklake_storage, sample_csv):
-        """Verify DuckDB connection is closed after a successful run."""
+    def test_pipeline_still_usable_after_success(self, ducklake_storage, sample_csv):
+        """Verify the shared storage connection is usable after a successful run."""
         pipeline = Pipeline(
             name="conn_test",
             source=CSVConnector(sample_csv),
@@ -73,12 +73,13 @@ class TestPipelineRunner:
         result = runner.run(pipeline)
 
         assert result["status"] == "success"
-        # The connection should have been closed; we can't easily inspect
-        # __closed__ from outside, but the finally block should handle it
+        # Shared connection should still be usable for reads
+        df = ducklake_storage.read("conn_out", "gold").fetchdf()
+        assert len(df) > 0
 
-    def test_pipeline_closes_connection_on_failure(self, ducklake_storage):
-        """Verify DuckDB connection is closed even when the pipeline fails."""
-        # Use a source that connects to a nonexistent Postgres
+    def test_shared_connection_usable_after_failure(self, ducklake_storage):
+        """Verify shared storage connection is usable even after a failed pipeline."""
+        # Use a source that will fail
         from connectors.postgres_connector import PostgresConnector
 
         pipeline = Pipeline(
@@ -95,6 +96,9 @@ class TestPipelineRunner:
 
         assert result["status"] == "failed"
         assert result["error"] is not None
+        # Shared connection should still be usable
+        datasets = ducklake_storage.list_datasets()
+        assert isinstance(datasets, list)
 
     def test_run_history_tracks_runs(self, ducklake_storage, sample_csv):
         pipeline = Pipeline(
