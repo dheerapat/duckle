@@ -75,14 +75,23 @@ class DuckLakeStorage:
         meta_conn = duckdb.connect(self.metadata_path)
         meta_conn.execute("""
             CREATE TABLE IF NOT EXISTS _metadata (
-                id          VARCHAR PRIMARY KEY,
-                name        VARCHAR,
-                layer       VARCHAR,
-                row_count   INTEGER,
-                created_at  TIMESTAMP,
-                pipeline    VARCHAR
+                id                VARCHAR PRIMARY KEY,
+                name              VARCHAR,
+                layer             VARCHAR,
+                row_count         INTEGER,
+                created_at        TIMESTAMP,
+                pipeline          VARCHAR,
+                cursor_column     VARCHAR DEFAULT NULL,
+                last_cursor_value VARCHAR DEFAULT NULL,
+                merge_keys        VARCHAR DEFAULT NULL,
+                run_mode          VARCHAR DEFAULT 'full'
             )
         """)
+        # Migrate existing _metadata databases created before incremental loading
+        meta_conn.execute("ALTER TABLE _metadata ADD COLUMN IF NOT EXISTS cursor_column VARCHAR DEFAULT NULL")
+        meta_conn.execute("ALTER TABLE _metadata ADD COLUMN IF NOT EXISTS last_cursor_value VARCHAR DEFAULT NULL")
+        meta_conn.execute("ALTER TABLE _metadata ADD COLUMN IF NOT EXISTS merge_keys VARCHAR DEFAULT NULL")
+        meta_conn.execute("ALTER TABLE _metadata ADD COLUMN IF NOT EXISTS run_mode VARCHAR DEFAULT 'full'")
 
         self.conn = conn
         self._meta_conn = meta_conn
@@ -126,14 +135,158 @@ class DuckLakeStorage:
         self._meta_conn.execute(
             """
             INSERT OR REPLACE INTO _metadata
-            VALUES (?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            [f"{layer}/{safe_name}", safe_name, layer, count, now, pipeline],
+            [
+                f"{layer}/{safe_name}",
+                safe_name,
+                layer,
+                count,
+                now,
+                pipeline,
+                None,
+                None,
+                None,
+                "full",
+            ],
         )
         self._meta_conn.commit()
 
         print(f"[DuckLake] Written {count} rows → {layer}.{safe_name}")
         return f"{layer}.{safe_name}"
+
+    def merge(
+        self,
+        table: str,
+        name: str,
+        layer: str,
+        merge_keys: list[str],
+        pipeline: Optional[str] = None,
+    ) -> str:
+        """Upsert a DuckDB table into DuckLake using MERGE INTO."""
+        assert layer in self.LAYERS, f"Layer must be one of {self.LAYERS}"
+
+        safe_table = safe_identifier(table, label="table")
+        safe_name = safe_identifier(name, label="dataset name")
+        dest = f"{layer}.{safe_name}"
+
+        row = self.conn.execute(
+            "SELECT COUNT(*) FROM information_schema.tables "
+            "WHERE table_schema = ? AND table_name = ?",
+            [layer, safe_name],
+        ).fetchone()
+        assert row is not None
+        exists = row[0]
+
+        if not exists:
+            return self.write(table, name, layer, pipeline)
+
+        on_clause = " AND ".join(
+            f"dest.{safe_identifier(k, label='merge key')} = src.{safe_identifier(k, label='merge key')}"
+            for k in merge_keys
+        )
+
+        self.conn.execute(f"""
+            MERGE INTO {dest} AS dest
+            USING {safe_table} AS src
+            ON ({on_clause})
+            WHEN MATCHED THEN UPDATE SET *
+            WHEN NOT MATCHED THEN INSERT *
+        """)
+
+        result = self.conn.execute(f"SELECT COUNT(*) FROM {dest}").fetchone()
+        count = result[0] if result is not None else 0
+
+        now = datetime.now(timezone.utc)
+        merge_keys_str = ",".join(merge_keys)
+        self._meta_conn.execute(
+            """
+            INSERT OR REPLACE INTO _metadata
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                f"{layer}/{safe_name}",
+                safe_name,
+                layer,
+                count,
+                now,
+                pipeline,
+                None,
+                None,
+                merge_keys_str,
+                "incremental",
+            ],
+        )
+        self._meta_conn.commit()
+
+        print(f"[DuckLake] Merged into {dest} ({count} total rows)")
+        return dest
+
+    def get_last_cursor(self, name: str, layer: str = "gold") -> Optional[str]:
+        """Return the last high-water mark cursor value for a dataset."""
+        safe_name = safe_identifier(name, label="dataset name")
+        row = self._meta_conn.execute(
+            "SELECT last_cursor_value FROM _metadata WHERE id = ?",
+            [f"{layer}/{safe_name}"],
+        ).fetchone()
+        return row[0] if row is not None else None
+
+    def update_pipeline_cursor(
+        self,
+        name: str,
+        layer: str,
+        cursor_column: Optional[str],
+        last_cursor_value: Optional[str],
+        merge_keys: Optional[list[str]],
+        run_mode: str,
+    ) -> None:
+        """Update cursor metadata for a dataset after a successful run."""
+        safe_name = safe_identifier(name, label="dataset name")
+        merge_keys_str = ",".join(merge_keys) if merge_keys else None
+        self._meta_conn.execute(
+            """
+            UPDATE _metadata
+            SET cursor_column = ?,
+                last_cursor_value = ?,
+                merge_keys = ?,
+                run_mode = ?
+            WHERE id = ?
+            """,
+            [
+                cursor_column,
+                last_cursor_value,
+                merge_keys_str,
+                run_mode,
+                f"{layer}/{safe_name}",
+            ],
+        )
+        self._meta_conn.commit()
+
+    def get_pipeline_state(self, name: str, layer: str = "gold") -> Optional[dict]:
+        """Return full metadata state for a dataset."""
+        safe_name = safe_identifier(name, label="dataset name")
+        row = self._meta_conn.execute(
+            """
+            SELECT name, layer, row_count, created_at, pipeline,
+                   cursor_column, last_cursor_value, merge_keys, run_mode
+            FROM _metadata
+            WHERE id = ?
+            """,
+            [f"{layer}/{safe_name}"],
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "name": row[0],
+            "layer": row[1],
+            "row_count": row[2],
+            "created_at": row[3],
+            "pipeline": row[4],
+            "cursor_column": row[5],
+            "last_cursor_value": row[6],
+            "merge_keys": row[7],
+            "run_mode": row[8],
+        }
 
     def read(self, name: str, layer: str = "gold") -> duckdb.DuckDBPyRelation:
         """Read a dataset from the DuckLake layer."""
@@ -146,7 +299,8 @@ class DuckLakeStorage:
     def list_datasets(self) -> list[dict]:
         """List all datasets registered in the metadata catalog."""
         return self._meta_conn.execute("""
-            SELECT name, layer, row_count, created_at, pipeline
+            SELECT name, layer, row_count, created_at, pipeline,
+                   cursor_column, last_cursor_value, merge_keys, run_mode
             FROM _metadata
             ORDER BY created_at DESC
         """).fetchdf().to_dict("records")

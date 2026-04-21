@@ -1,4 +1,5 @@
 import traceback
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import List, Optional
 
@@ -8,6 +9,13 @@ from utils.sql_safety import safe_identifier
 from engine.transformer import Transformer
 from quality.checker import QualityChecker, QualityRule
 from storage.ducklake import DuckLakeStorage
+
+
+@dataclass
+class IncrementalConfig:
+    cursor_column: str
+    merge_keys: list[str]
+    default_full_refresh: bool = False
 
 
 class Pipeline:
@@ -32,6 +40,7 @@ class Pipeline:
         quality_rules: Optional[List[QualityRule]] = None,
         source: Optional[BaseConnector] = None,
         sources: Optional[dict[str, BaseConnector]] = None,
+        incremental: Optional[IncrementalConfig] = None,
     ):
         if source is not None and sources is not None:
             raise ValueError("Provide only one of 'source' or 'sources'")
@@ -43,7 +52,13 @@ class Pipeline:
         self.destination_name = destination_name
         self.destination_layer = destination_layer
         self.quality_rules = quality_rules or []
+        self.incremental = incremental
         self.sources: dict[str, BaseConnector]
+
+        if incremental is not None:
+            if not incremental.merge_keys:
+                raise ValueError("incremental.merge_keys must be non-empty")
+            safe_identifier(incremental.cursor_column, label="cursor_column")
 
         # Normalise into a dict of {alias: connector}
         if source is not None:
@@ -60,7 +75,7 @@ class PipelineRunner:
         self.storage = storage or DuckLakeStorage()
         self.run_history = []
 
-    def run(self, pipeline: Pipeline) -> dict:
+    def run(self, pipeline: Pipeline, full_refresh: bool = False) -> dict:
         run = {
             "pipeline": pipeline.name,
             "started_at": datetime.now(timezone.utc).isoformat(),
@@ -72,11 +87,35 @@ class PipelineRunner:
         conn = self.storage.conn
         intermediate_tables: List[str] = []
 
+        incremental = pipeline.incremental
+        since_value: Optional[str] = None
+        run_mode = "full"
+
+        if incremental is not None and not full_refresh:
+            since_value = self.storage.get_last_cursor(
+                pipeline.destination_name, pipeline.destination_layer
+            )
+            if since_value is not None:
+                run_mode = "incremental"
+                print(
+                    f"[Incremental] High-water mark: {incremental.cursor_column} > {since_value}"
+                )
+            else:
+                print(
+                    "[Incremental] No prior cursor found, falling back to full load."
+                )
+
         try:
             # 1. EXTRACT
             print("\n[1/4] Extracting...")
             for alias, connector in pipeline.sources.items():
-                connector.extract(conn, alias)
+                if run_mode == "incremental" and since_value is not None:
+                    assert incremental is not None
+                    connector.extract_incremental(
+                        conn, alias, incremental.cursor_column, since_value
+                    )
+                else:
+                    connector.extract(conn, alias)
                 intermediate_tables.append(alias)
 
             # 2. TRANSFORM
@@ -102,15 +141,56 @@ class PipelineRunner:
 
             # 4. LOAD
             print("\n[4/4] Loading to DuckLake...")
-            self.storage.write(
-                final_table,
-                name=pipeline.destination_name,
-                layer=pipeline.destination_layer,
-                pipeline=pipeline.name,
-            )
+            if run_mode == "incremental" and since_value is not None:
+                assert pipeline.incremental is not None
+                self.storage.merge(
+                    final_table,
+                    name=pipeline.destination_name,
+                    layer=pipeline.destination_layer,
+                    merge_keys=pipeline.incremental.merge_keys,
+                    pipeline=pipeline.name,
+                )
+            else:
+                self.storage.write(
+                    final_table,
+                    name=pipeline.destination_name,
+                    layer=pipeline.destination_layer,
+                    pipeline=pipeline.name,
+                )
 
             run["status"] = "success"
             print(f"\n✅ Pipeline '{pipeline.name}' completed successfully.")
+
+            # 5. UPDATE CURSOR
+            if incremental is not None and run["status"] == "success":
+                safe_cursor = safe_identifier(
+                    incremental.cursor_column, label="cursor_column"
+                )
+                # Verify cursor column exists in final output
+                cols = (
+                    conn.execute(f"SELECT * FROM {final_table} LIMIT 0")
+                    .fetchdf()
+                    .columns.tolist()
+                )
+                if safe_cursor not in cols:
+                    raise ValueError(
+                        f"Incremental cursor column '{incremental.cursor_column}' not found "
+                        f"in transformed output. Available columns: {cols}"
+                    )
+                row = conn.execute(
+                    f"SELECT MAX({safe_cursor}) FROM {final_table}"
+                ).fetchone()
+                assert row is not None
+                new_cursor = row[0]
+                self.storage.update_pipeline_cursor(
+                    pipeline.destination_name,
+                    pipeline.destination_layer,
+                    cursor_column=incremental.cursor_column,
+                    last_cursor_value=str(new_cursor) if new_cursor is not None else None,
+                    merge_keys=incremental.merge_keys,
+                    run_mode=run_mode,
+                )
+                print(f"[Incremental] Cursor updated to {new_cursor}")
 
         except Exception as e:
             run["status"] = "failed"

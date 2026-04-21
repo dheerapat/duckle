@@ -79,3 +79,71 @@ class TestDuckLakeStorage:
         remaining = conn.execute("SHOW TABLES").fetchdf()["name"].tolist()
         assert "raw" not in remaining
         assert "_transform_step_0" not in remaining
+
+    def test_merge_updates_and_inserts(self, ducklake_storage):
+        """MERGE INTO should update existing rows and insert new ones."""
+        conn = ducklake_storage.conn
+        conn.execute("CREATE TABLE dest AS SELECT 1 AS id, 10 AS val")
+        ducklake_storage.write("dest", name="merge_ds", layer="gold")
+
+        conn.execute("CREATE TABLE src AS SELECT * FROM (VALUES (1, 99), (2, 20)) t(id, val)")
+        ducklake_storage.merge("src", name="merge_ds", layer="gold", merge_keys=["id"])
+
+        df = ducklake_storage.read("merge_ds", "gold").fetchdf()
+        assert len(df) == 2
+        row1 = df[df["id"] == 1].iloc[0]
+        row2 = df[df["id"] == 2].iloc[0]
+        assert row1["val"] == 99
+        assert row2["val"] == 20
+
+    def test_merge_fallback_to_write_when_missing(self, ducklake_storage):
+        """merge() should fall back to write if the destination does not exist."""
+        conn = ducklake_storage.conn
+        conn.execute("CREATE TABLE src AS SELECT 1 AS id, 10 AS val")
+        ducklake_storage.merge("src", name="new_merge_ds", layer="gold", merge_keys=["id"])
+
+        df = ducklake_storage.read("new_merge_ds", "gold").fetchdf()
+        assert len(df) == 1
+
+    def test_get_last_cursor(self, ducklake_storage):
+        ducklake_storage.conn.execute("CREATE TABLE src AS SELECT 1 AS id")
+        ducklake_storage.write("src", name="cursor_ds", layer="gold")
+        assert ducklake_storage.get_last_cursor("cursor_ds", "gold") is None
+
+        ducklake_storage.update_pipeline_cursor(
+            "cursor_ds", "gold", cursor_column="dt", last_cursor_value="2024-01-01",
+            merge_keys=["id"], run_mode="incremental"
+        )
+        assert ducklake_storage.get_last_cursor("cursor_ds", "gold") == "2024-01-01"
+
+    def test_get_pipeline_state(self, ducklake_storage):
+        ducklake_storage.conn.execute("CREATE TABLE src AS SELECT 1 AS id")
+        ducklake_storage.write("src", name="state_ds", layer="gold", pipeline="p1")
+        ducklake_storage.update_pipeline_cursor(
+            "state_ds", "gold", cursor_column="dt", last_cursor_value="2024-01-01",
+            merge_keys=["id"], run_mode="incremental"
+        )
+        state = ducklake_storage.get_pipeline_state("state_ds", "gold")
+        assert state is not None
+        assert state["name"] == "state_ds"
+        assert state["layer"] == "gold"
+        assert state["cursor_column"] == "dt"
+        assert state["last_cursor_value"] == "2024-01-01"
+        assert state["merge_keys"] == "id"
+        assert state["run_mode"] == "incremental"
+        assert state["pipeline"] == "p1"
+
+    def test_get_pipeline_state_missing(self, ducklake_storage):
+        assert ducklake_storage.get_pipeline_state("missing", "gold") is None
+
+    def test_merge_keys_metadata_stored(self, ducklake_storage):
+        conn = ducklake_storage.conn
+        conn.execute("CREATE TABLE dest AS SELECT 1 AS id, 10 AS val")
+        ducklake_storage.write("dest", name="meta_merge", layer="gold")
+
+        conn.execute("CREATE TABLE src AS SELECT 2 AS id, 20 AS val")
+        ducklake_storage.merge("src", name="meta_merge", layer="gold", merge_keys=["id", "val"])
+
+        state = ducklake_storage.get_pipeline_state("meta_merge", "gold")
+        assert state["merge_keys"] == "id,val"
+        assert state["run_mode"] == "incremental"

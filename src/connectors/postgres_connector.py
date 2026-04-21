@@ -1,3 +1,5 @@
+import re
+
 import duckdb
 from connectors.base import BaseConnector
 from utils.sql_safety import safe_identifier, safe_path
@@ -41,6 +43,11 @@ class PostgresConnector(BaseConnector):
         except Exception:
             pass  # already detached or never attached
 
+    def _validate_cursor_value(self, value: str) -> None:
+        """Reject cursor values that could break out of a SQL string."""
+        if re.search(r"['\";\\]", str(value)):
+            raise ValueError(f"Unsafe cursor value: {value!r}")
+
     def extract(self, conn: duckdb.DuckDBPyConnection, table_name: str) -> None:
         self._attach(conn)
         table_name = safe_identifier(table_name, label="table_name")
@@ -56,6 +63,33 @@ class PostgresConnector(BaseConnector):
         count = result[0] if result is not None else 0
         print(f"[PostgresConnector] Loaded {count} rows → {table_name}")
 
+        self._detach(conn)
+
+    def extract_incremental(
+        self,
+        conn: duckdb.DuckDBPyConnection,
+        table_name: str,
+        cursor_column: str,
+        since_value: str,
+    ) -> None:
+        self._attach(conn)
+        self._validate_cursor_value(since_value)
+        safe_col = safe_identifier(cursor_column, label="cursor_column")
+        safe_tbl = safe_identifier(table_name, label="table_name")
+
+        # postgres_query parameterises the whole query string, so we embed
+        # the validated cursor value directly.
+        filtered_query = (
+            f"SELECT * FROM ({self.query}) AS _src WHERE {safe_col} > '{since_value}'"
+        )
+        conn.execute(
+            f"CREATE OR REPLACE TABLE {safe_tbl} AS "
+            f"SELECT * FROM postgres_query('{_PG_ALIAS}', ?)",
+            [filtered_query],
+        )
+        result = conn.execute(f"SELECT COUNT(*) FROM {safe_tbl}").fetchone()
+        count = result[0] if result is not None else 0
+        print(f"[PostgresConnector] Incrementally loaded {count} rows → {safe_tbl}")
         self._detach(conn)
 
     def test_connection(self) -> bool:

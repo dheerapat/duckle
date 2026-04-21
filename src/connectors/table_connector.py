@@ -48,6 +48,27 @@ class TableConnector(BaseConnector):
         count = result[0] if result is not None else 0
         print(f"[TableConnector] Copied {count} rows from {source} → {table_name}")
 
+    def extract_incremental(
+        self,
+        conn: duckdb.DuckDBPyConnection,
+        table_name: str,
+        cursor_column: str,
+        since_value: str,
+    ) -> None:
+        source = _resolve_table_ref(self.source_table)
+        safe_col = safe_identifier(cursor_column, label="cursor_column")
+        safe_tbl = safe_identifier(table_name, label="table_name")
+        conn.execute(
+            f"CREATE OR REPLACE TABLE {safe_tbl} AS "
+            f"SELECT * FROM {source} WHERE {safe_col} > ?",
+            [since_value],
+        )
+        result = conn.execute(f"SELECT COUNT(*) FROM {safe_tbl}").fetchone()
+        count = result[0] if result is not None else 0
+        print(
+            f"[TableConnector] Incrementally loaded {count} rows from {source} → {safe_tbl}"
+        )
+
     def test_connection(self) -> bool:
         # We can't test without a connection, so assume the table exists
         return True
