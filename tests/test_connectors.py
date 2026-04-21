@@ -13,7 +13,8 @@ class TestCSVConnector:
     def test_extract_loads_rows(self, duck_conn, sample_csv):
         connector = CSVConnector(sample_csv)
         connector.extract(duck_conn, "raw")
-        count = duck_conn.execute("SELECT COUNT(*) FROM raw").fetchone()[0]
+        result = duck_conn.execute("SELECT COUNT(*) FROM raw").fetchone()
+        count = result[0]
         assert count == 5
 
     def test_extract_correct_data(self, duck_conn, sample_csv):
@@ -57,7 +58,8 @@ class TestAPIConnector:
             mock_get.return_value = self._mock_response(data)
             connector = APIConnector("https://example.com/api")
             connector.extract(duck_conn, "raw")
-            count = duck_conn.execute("SELECT COUNT(*) FROM raw").fetchone()[0]
+            result = duck_conn.execute("SELECT COUNT(*) FROM raw").fetchone()
+            count = result[0]
             assert count == 2
 
     def test_extract_nested_json_path(self, duck_conn):
@@ -68,7 +70,8 @@ class TestAPIConnector:
                 "https://example.com/api", json_path="data.results"
             )
             connector.extract(duck_conn, "raw")
-            count = duck_conn.execute("SELECT COUNT(*) FROM raw").fetchone()[0]
+            result = duck_conn.execute("SELECT COUNT(*) FROM raw").fetchone()
+            count = result[0]
             assert count == 2
 
     def test_extract_bad_json_path_raises(self, duck_conn):

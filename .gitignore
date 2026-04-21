@@ -8,8 +8,8 @@ dist/
 .venv/
 
 # Generated data (runtime)
-data/
-lake/
+data*/
+lake*/
 
 # Docker volume (runtime)
 postgres_data/
