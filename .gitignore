@@ -7,10 +7,16 @@ dist/
 # uv / virtual env
 .venv/
 
-# Generated data
+# Generated data (runtime)
 data/
 lake/
+
+# Docker volume (runtime)
+postgres_data/
 
 # IDE
 .idea/
 .vscode/
+
+# Environment (contains credentials)
+.env
