@@ -123,18 +123,6 @@ def generate_data() -> dict[str, str]:
 
 # ── Helpers ────────────────────────────────────────────────────────────
 
-def _create_staging(conn, sql: str, table_name: str) -> str:
-    """Execute a CREATE OR REPLACE TABLE from arbitrary SQL and return the table name.
-
-    This is used for multi-table joins that reference DuckLake schemas (e.g. bronze.*, silver.*),
-    which can't go through Transformer's {{input}} placeholder since those identifiers contain dots.
-    """
-    conn.execute(f"CREATE OR REPLACE TABLE {table_name} AS {sql}")
-    result = conn.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()
-    count = result[0] if result is not None else 0
-    print(f"    Staging: {count} rows → {table_name}")
-    return table_name
-
 
 def _run_pipeline(runner: PipelineRunner, pipeline: Pipeline) -> dict:
     """Run a pipeline, assert success, and return the result."""
@@ -187,7 +175,6 @@ def test_silver_clean(storage: DuckLakeStorage) -> None:
     print("=" * 60)
 
     runner = PipelineRunner(storage=storage)
-    conn = storage.conn
 
     # ── products: dedupe, filter, compute margin ──────────────────────
     print("\n  → products")
@@ -232,25 +219,29 @@ def test_silver_clean(storage: DuckLakeStorage) -> None:
     # This requires a JOIN across schemas, so we stage the join result
     # then feed it through PipelineRunner for the quality check + write.
     print("  → order_lines")
-    _create_staging(conn, """
-        SELECT
-            ol.line_id,
-            CAST(ol.order_date AS DATE) AS order_date,
-            ol.customer_id,
-            ol.product_id,
-            ol.quantity,
-            ol.discount_pct,
-            p.price AS unit_price,
-            ROUND(ol.quantity * p.price, 2) AS gross_amount,
-            ROUND(ol.quantity * p.price * (1 - ol.discount_pct / 100.0), 2) AS net_amount
-        FROM bronze.order_lines AS ol
-        JOIN silver.products AS p ON ol.product_id = p.product_id
-        WHERE ol.quantity > 0 AND ol.discount_pct >= 0 AND ol.discount_pct <= 100
-    """, "stg__order_lines")
     pipeline = Pipeline(
         name="csv_silver_order_lines",
-        source=TableConnector("stg__order_lines"),
-        transforms=["SELECT * FROM {{input}}"],
+        sources={
+            "ol": TableConnector("bronze.order_lines"),
+            "p": TableConnector("silver.products"),
+        },
+        transforms=[
+            """
+            SELECT
+                ol.line_id,
+                CAST(ol.order_date AS DATE) AS order_date,
+                ol.customer_id,
+                ol.product_id,
+                ol.quantity,
+                ol.discount_pct,
+                p.price AS unit_price,
+                ROUND(ol.quantity * p.price, 2) AS gross_amount,
+                ROUND(ol.quantity * p.price * (1 - ol.discount_pct / 100.0), 2) AS net_amount
+            FROM ol
+            JOIN p ON ol.product_id = p.product_id
+            WHERE ol.quantity > 0 AND ol.discount_pct >= 0 AND ol.discount_pct <= 100
+            """,
+        ],
         destination_name="order_lines",
         destination_layer="silver",
         quality_rules=[no_nulls("line_id"), no_nulls("order_date"),
@@ -297,27 +288,28 @@ def test_gold_aggregates(storage: DuckLakeStorage) -> None:
     print("=" * 60)
 
     runner = PipelineRunner(storage=storage)
-    conn = storage.conn
 
     # ── daily_category_revenue ─────────────────────────────────────────
     print("\n  → daily_category_revenue")
-    _create_staging(conn, """
-        SELECT
-            ol.order_date,
-            p.category,
-            SUM(ol.net_amount)   AS revenue,
-            SUM(ol.quantity)      AS items_sold,
-            COUNT(DISTINCT ol.customer_id) AS unique_customers,
-            COUNT(*)              AS order_lines
-        FROM silver.order_lines AS ol
-        JOIN silver.products  AS p ON ol.product_id = p.product_id
-        GROUP BY ol.order_date, p.category
-    """, "stg__dcr")
-
     pipeline = Pipeline(
         name="gold_daily_revenue",
-        source=TableConnector("stg__dcr"),
+        sources={
+            "ol": TableConnector("silver.order_lines"),
+            "p": TableConnector("silver.products"),
+        },
         transforms=[
+            """
+            SELECT
+                ol.order_date,
+                p.category,
+                SUM(ol.net_amount)   AS revenue,
+                SUM(ol.quantity)      AS items_sold,
+                COUNT(DISTINCT ol.customer_id) AS unique_customers,
+                COUNT(*)              AS order_lines
+            FROM ol
+            JOIN p ON ol.product_id = p.product_id
+            GROUP BY ol.order_date, p.category
+            """,
             """
             SELECT *,
                 CASE
@@ -338,26 +330,28 @@ def test_gold_aggregates(storage: DuckLakeStorage) -> None:
 
     # ── customer_lifetime_value ────────────────────────────────────────
     print("  → customer_lifetime_value")
-    _create_staging(conn, """
-        SELECT
-            c.customer_id,
-            c.name             AS customer_name,
-            c.region,
-            COUNT(*)           AS total_orders,
-            SUM(ol.net_amount) AS total_spent,
-            ROUND(AVG(ol.net_amount), 2) AS avg_order_value,
-            MIN(ol.order_date) AS first_order,
-            MAX(ol.order_date) AS last_order,
-            DATEDIFF('day', MIN(ol.order_date), MAX(ol.order_date)) AS active_days
-        FROM silver.order_lines AS ol
-        JOIN silver.customers  AS c ON ol.customer_id = c.customer_id
-        GROUP BY c.customer_id, c.name, c.region
-    """, "stg__clv")
-
     pipeline = Pipeline(
         name="gold_customer_clv",
-        source=TableConnector("stg__clv"),
+        sources={
+            "ol": TableConnector("silver.order_lines"),
+            "c": TableConnector("silver.customers"),
+        },
         transforms=[
+            """
+            SELECT
+                c.customer_id,
+                c.name             AS customer_name,
+                c.region,
+                COUNT(*)           AS total_orders,
+                SUM(ol.net_amount) AS total_spent,
+                ROUND(AVG(ol.net_amount), 2) AS avg_order_value,
+                MIN(ol.order_date) AS first_order,
+                MAX(ol.order_date) AS last_order,
+                DATEDIFF('day', MIN(ol.order_date), MAX(ol.order_date)) AS active_days
+            FROM ol
+            JOIN c ON ol.customer_id = c.customer_id
+            GROUP BY c.customer_id, c.name, c.region
+            """,
             """
             SELECT *,
                 CASE
@@ -382,25 +376,27 @@ def test_gold_aggregates(storage: DuckLakeStorage) -> None:
 
     # ── product_performance ────────────────────────────────────────────
     print("  → product_performance")
-    _create_staging(conn, """
-        SELECT
-            p.product_id,
-            p.name           AS product_name,
-            p.category,
-            p.margin,
-            SUM(ol.quantity)     AS total_sold,
-            SUM(ol.net_amount)   AS total_revenue,
-            COUNT(*)              AS times_ordered,
-            ROUND(p.margin * SUM(ol.quantity), 2) AS total_margin
-        FROM silver.products    AS p
-        JOIN silver.order_lines AS ol ON ol.product_id = p.product_id
-        GROUP BY p.product_id, p.name, p.category, p.margin
-    """, "stg__pp")
-
     pipeline = Pipeline(
         name="gold_product_performance",
-        source=TableConnector("stg__pp"),
+        sources={
+            "p": TableConnector("silver.products"),
+            "ol": TableConnector("silver.order_lines"),
+        },
         transforms=[
+            """
+            SELECT
+                p.product_id,
+                p.name           AS product_name,
+                p.category,
+                p.margin,
+                SUM(ol.quantity)     AS total_sold,
+                SUM(ol.net_amount)   AS total_revenue,
+                COUNT(*)              AS times_ordered,
+                ROUND(p.margin * SUM(ol.quantity), 2) AS total_margin
+            FROM p
+            JOIN ol ON ol.product_id = p.product_id
+            GROUP BY p.product_id, p.name, p.category, p.margin
+            """,
             """
             SELECT *,
                 ROUND(total_margin / NULLIF(total_revenue, 0) * 100, 2) AS margin_pct,
@@ -420,23 +416,25 @@ def test_gold_aggregates(storage: DuckLakeStorage) -> None:
 
     # ── regional_summary ───────────────────────────────────────────────
     print("  → regional_summary")
-    _create_staging(conn, """
-        SELECT
-            c.region,
-            COUNT(DISTINCT c.customer_id)            AS customers,
-            SUM(ol.net_amount)                        AS total_revenue,
-            ROUND(AVG(ol.net_amount), 2)              AS avg_order_value,
-            COUNT(*)                                   AS total_lines,
-            SUM(ol.quantity)                           AS total_items
-        FROM silver.order_lines AS ol
-        JOIN silver.customers AS c ON ol.customer_id = c.customer_id
-        GROUP BY c.region
-    """, "stg__rs")
-
     pipeline = Pipeline(
         name="gold_regional_summary",
-        source=TableConnector("stg__rs"),
+        sources={
+            "ol": TableConnector("silver.order_lines"),
+            "c": TableConnector("silver.customers"),
+        },
         transforms=[
+            """
+            SELECT
+                c.region,
+                COUNT(DISTINCT c.customer_id)            AS customers,
+                SUM(ol.net_amount)                        AS total_revenue,
+                ROUND(AVG(ol.net_amount), 2)              AS avg_order_value,
+                COUNT(*)                                   AS total_lines,
+                SUM(ol.quantity)                           AS total_items
+            FROM ol
+            JOIN c ON ol.customer_id = c.customer_id
+            GROUP BY c.region
+            """,
             """
             SELECT *,
                 ROUND(total_revenue / NULLIF(customers, 0), 2) AS revenue_per_customer,

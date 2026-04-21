@@ -116,3 +116,99 @@ class TestPipelineRunner:
         for entry in runner.run_history:
             assert "started_at" in entry
             assert "finished_at" in entry
+
+    def test_multi_source_pipeline(self, ducklake_storage):
+        """Pipeline with multiple sources can JOIN across extracted tables."""
+        from connectors.table_connector import TableConnector
+
+        conn = ducklake_storage.conn
+        conn.execute(
+            "CREATE TABLE tbl_a AS SELECT * FROM (VALUES (1, 'alpha'), (2, 'beta')) t(id, label)"
+        )
+        conn.execute(
+            "CREATE TABLE tbl_b AS SELECT * FROM (VALUES (1, 100), (2, 200)) t(id, value)"
+        )
+
+        pipeline = Pipeline(
+            name="multi_join_pipe",
+            sources={
+                "a": TableConnector("tbl_a"),
+                "b": TableConnector("tbl_b"),
+            },
+            transforms=[
+                "SELECT a.id, a.label, b.value FROM a JOIN b ON a.id = b.id",
+            ],
+            destination_name="joined",
+            destination_layer="gold",
+        )
+        runner = PipelineRunner(storage=ducklake_storage)
+        result = runner.run(pipeline)
+
+        assert result["status"] == "success"
+        df = ducklake_storage.read("joined", "gold").fetchdf()
+        assert len(df) == 2
+        assert list(df["label"]) == ["alpha", "beta"]
+        assert list(df["value"]) == [100, 200]
+
+    def test_multi_source_transform_chain(self, ducklake_storage):
+        """Multi-source pipeline with chained transform steps."""
+        from connectors.table_connector import TableConnector
+
+        conn = ducklake_storage.conn
+        conn.execute(
+            "CREATE TABLE orders AS SELECT * FROM (VALUES (1, 50), (2, 75)) t(order_id, amount)"
+        )
+        conn.execute(
+            "CREATE TABLE customers AS SELECT * FROM (VALUES (1, 'Alice'), (2, 'Bob')) t(id, name)"
+        )
+
+        pipeline = Pipeline(
+            name="multi_chain_pipe",
+            sources={
+                "o": TableConnector("orders"),
+                "c": TableConnector("customers"),
+            },
+            transforms=[
+                "SELECT o.order_id, o.amount, c.name FROM o JOIN c ON o.order_id = c.id",
+                "SELECT * FROM {{input}} WHERE amount >= 50",
+            ],
+            destination_name="filtered_join",
+            destination_layer="gold",
+        )
+        runner = PipelineRunner(storage=ducklake_storage)
+        result = runner.run(pipeline)
+
+        assert result["status"] == "success"
+        df = ducklake_storage.read("filtered_join", "gold").fetchdf()
+        assert len(df) == 2
+
+    def test_pipeline_rejects_both_source_and_sources(self):
+        from connectors.csv_connector import CSVConnector
+
+        with pytest.raises(ValueError, match="only one"):
+            Pipeline(
+                name="bad",
+                source=CSVConnector("x.csv"),
+                sources={"a": CSVConnector("y.csv")},
+                transforms=["SELECT 1"],
+                destination_name="out",
+            )
+
+    def test_pipeline_rejects_neither_source_nor_sources(self):
+        with pytest.raises(ValueError, match="required"):
+            Pipeline(
+                name="bad",
+                transforms=["SELECT 1"],
+                destination_name="out",
+            )
+
+    def test_pipeline_rejects_invalid_alias(self):
+        from connectors.csv_connector import CSVConnector
+
+        with pytest.raises(ValueError, match="alias"):
+            Pipeline(
+                name="bad",
+                sources={"bad-alias": CSVConnector("x.csv")},
+                transforms=["SELECT 1"],
+                destination_name="out",
+            )

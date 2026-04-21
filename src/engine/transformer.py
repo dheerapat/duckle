@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Optional
 
 import duckdb
 from utils.sql_safety import safe_identifier
@@ -7,24 +7,31 @@ from utils.sql_safety import safe_identifier
 class Transformer:
     """
     Runs SQL transformations inside DuckDB.
-    Each step takes the output of the previous step as input.
+    Each step can reference the previous step via ``{{input}}``.
+    Supports two modes:
+
+    * Single-source (backward compat): ``source_table`` is set; step 0
+      substitutes ``{{input}}`` with that table name.
+    * Multi-source: ``source_table`` is ``None``; step 0 is used as-is
+      (SQL references pre-extracted aliases like ``oi``, ``m``, etc.).
     """
 
     def __init__(self, conn: duckdb.DuckDBPyConnection):
         self.conn = conn
 
-    def run(self, steps: List[str], source_table: str) -> str:
+    def run(self, steps: List[str], source_table: Optional[str] = None) -> str:
         """
         Run a list of SQL transform steps.
         Returns the name of the final output table.
         """
-        source_table = safe_identifier(source_table, label="source_table")
+        if source_table is not None:
+            source_table = safe_identifier(source_table, label="source_table")
         current_table = source_table
 
         for i, sql in enumerate(steps):
             output_table = safe_identifier(f"_transform_step_{i}", label="output_table")
             # Allow referencing previous step via {{input}} placeholder
-            resolved_sql = sql.replace("{{input}}", current_table)
+            resolved_sql = sql.replace("{{input}}", current_table) if current_table else sql
             self.conn.execute(
                 f"CREATE OR REPLACE TABLE {output_table} AS {resolved_sql}"
             )
