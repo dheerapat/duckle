@@ -30,7 +30,6 @@ from storage.ducklake import DuckLakeStorage
 # ── Paths ─────────────────────────────────────────────────────────────
 BASE_DIR = os.path.dirname(os.path.dirname(__file__))
 DATA_DIR = os.path.join(BASE_DIR, "data_test_csv")
-LAKE_DIR = os.path.join(BASE_DIR, "lake_test_csv")
 
 
 def _write_csv(path: str, header: list[str], rows: list[list]) -> None:
@@ -140,10 +139,11 @@ def test_bronze_ingest(paths: dict[str, str]) -> DuckLakeStorage:
     print("STEP 1 — Bronze: raw ingest")
     print("=" * 60)
 
-    if os.path.exists(LAKE_DIR):
-        shutil.rmtree(LAKE_DIR)
+    for f in ["./ducklake.ducklake", "./ducklake.files", "./_metadata.db"]:
+        if os.path.exists(f):
+            shutil.rmtree(f) if os.path.isdir(f) else os.remove(f)
 
-    storage = DuckLakeStorage(base_path=LAKE_DIR)
+    storage = DuckLakeStorage()
     runner = PipelineRunner(storage=storage)
 
     for name, path in paths.items():
@@ -479,9 +479,12 @@ def test_preview_all(storage: DuckLakeStorage) -> None:
 # ── Main ──────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    for path in [DATA_DIR, LAKE_DIR]:
+    for path in [DATA_DIR]:
         if os.path.exists(path):
             shutil.rmtree(path)
+    for f in ["./ducklake.ducklake", "./ducklake.files", "./_metadata.db"]:
+        if os.path.exists(f):
+            shutil.rmtree(f) if os.path.isdir(f) else os.remove(f)
 
     print("🦆 Duckle CSV ETL Integration Script")
     print("=" * 60)

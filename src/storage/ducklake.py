@@ -24,35 +24,37 @@ class DuckLakeStorage:
 
     LAYERS = ["bronze", "silver", "gold"]
 
-    def __init__(self, base_path: str = "./lake"):
-        self.base_path = base_path
+    def __init__(self):
+        self.catalog_path = os.environ.get("DUCKLAKE_CATALOG_PATH", "./lake/ducklake.ducklake")
+        self.ducklake_path = os.environ.get("DUCKLAKE_DATA_PATH", "./lake/ducklake.files")
+        self.metadata_path = os.environ.get("DUCKLAKE_METADATA_PATH", "./lake/_metadata.db")
         self.conn: duckdb.DuckDBPyConnection
         self._meta_conn: duckdb.DuckDBPyConnection
-        self._ensure_base_path()
+        self._ensure_paths()
         self._init_ducklake()
 
     # ------------------------------------------------------------------
     # Initialisation
     # ------------------------------------------------------------------
 
-    def _ensure_base_path(self):
-        """Ensure the base directory exists (DuckLake ATTACH requires it)."""
-        os.makedirs(self.base_path, exist_ok=True)
+    def _ensure_paths(self):
+        """Ensure parent directories for all paths exist."""
+        for path in (self.catalog_path, self.ducklake_path, self.metadata_path):
+            os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
 
     def _init_ducklake(self):
         """
         Create or attach the DuckLake database.
 
-        • Catalog file : <base_path>/ducklake.ducklake
-        • Data files   : <base_path>/ducklake.ducklake.files/  (Parquet)
+        • Catalog file : <catalog_path>
+        • Data files   : <ducklake_path>/  (Parquet)
         """
-        catalog_path = os.path.join(self.base_path, "ducklake.ducklake")
-
         conn = duckdb.connect()
         conn.execute("INSTALL ducklake")
         conn.execute("LOAD ducklake")
         conn.execute(
-            f"ATTACH 'ducklake:{catalog_path}' AS ducklake"
+            f"ATTACH 'ducklake:{self.catalog_path}' AS ducklake "
+            f"(DATA_PATH '{self.ducklake_path}')"
         )
         conn.execute("USE ducklake")
 
@@ -63,8 +65,7 @@ class DuckLakeStorage:
         # Lightweight metadata table for pipeline-level info
         # (DuckLake itself does not track arbitrary metadata like pipeline name)
         # Stored in a separate DuckDB file because DuckLake tables don't support PKs
-        metadata_file = os.path.join(self.base_path, "_metadata.db")
-        meta_conn = duckdb.connect(metadata_file)
+        meta_conn = duckdb.connect(self.metadata_path)
         meta_conn.execute("""
             CREATE TABLE IF NOT EXISTS _metadata (
                 id          VARCHAR PRIMARY KEY,

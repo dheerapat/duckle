@@ -31,7 +31,6 @@ from storage.ducklake import DuckLakeStorage
 
 # ── Config ────────────────────────────────────────────────────────────
 PG_CONN = "host=localhost port=5433 dbname=restaurant user=duckle password=duckle_secret"
-LAKE_DIR = os.path.join(os.path.dirname(__file__), "..", "lake_test_pg")
 
 
 # ── Helpers ────────────────────────────────────────────────────────────
@@ -65,10 +64,11 @@ def test_bronze_ingest() -> DuckLakeStorage:
     print("STEP 1 — Bronze: raw ingest from Postgres")
     print("=" * 60)
 
-    if os.path.exists(LAKE_DIR):
-        shutil.rmtree(LAKE_DIR)
+    for f in ["./ducklake.ducklake", "./ducklake.files", "./_metadata.db"]:
+        if os.path.exists(f):
+            shutil.rmtree(f) if os.path.isdir(f) else os.remove(f)
 
-    storage = DuckLakeStorage(base_path=LAKE_DIR)
+    storage = DuckLakeStorage()
     runner = PipelineRunner(storage=storage)
 
     tables = {

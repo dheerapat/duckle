@@ -40,10 +40,15 @@ def sample_csv(tmp_path):
 
 
 @pytest.fixture
-def ducklake_storage(tmp_path):
+def ducklake_storage(tmp_path, monkeypatch):
     """Provide a DuckLakeStorage instance rooted in a temp dir, closed after test."""
     from storage.ducklake import DuckLakeStorage
 
-    storage = DuckLakeStorage(base_path=str(tmp_path / "lake"))
+    lake = str(tmp_path / "lake")
+    monkeypatch.setenv("DUCKLAKE_CATALOG_PATH", f"{lake}/catalog.ducklake")
+    monkeypatch.setenv("DUCKLAKE_DATA_PATH", f"{lake}/ducklake.files")
+    monkeypatch.setenv("DUCKLAKE_METADATA_PATH", f"{lake}/_metadata.db")
+
+    storage = DuckLakeStorage()
     yield storage
     storage.close()
