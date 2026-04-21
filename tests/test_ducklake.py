@@ -35,9 +35,7 @@ class TestDuckLakeStorage:
 
     def test_list_datasets(self, ducklake_storage):
         ducklake_storage.conn.execute("CREATE TABLE src AS SELECT 1 AS id")
-        ducklake_storage.write(
-            "src", name="listed", layer="gold", pipeline="my_pipe"
-        )
+        ducklake_storage.write("src", name="listed", layer="gold", pipeline="my_pipe")
         datasets = ducklake_storage.list_datasets()
         assert len(datasets) >= 1
         ds = [d for d in datasets if d["name"] == "listed"][0]

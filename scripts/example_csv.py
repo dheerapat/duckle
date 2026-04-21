@@ -24,7 +24,13 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 from connectors.csv_connector import CSVConnector
 from connectors.table_connector import TableConnector
 from orchestrator.runner import Pipeline, PipelineRunner
-from quality.checker import QualityChecker, column_positive, min_row_count, no_nulls, unique_column
+from quality.checker import (
+    QualityChecker,
+    column_positive,
+    min_row_count,
+    no_nulls,
+    unique_column,
+)
 from storage.ducklake import DuckLakeStorage
 
 # ── Paths ─────────────────────────────────────────────────────────────
@@ -56,19 +62,30 @@ def generate_data() -> dict[str, str]:
         price = round(cost * random.uniform(1.4, 2.2), 2)
         products.append([i, f"Product-{i:02d}", cat, cost, price])
     products_path = os.path.join(DATA_DIR, "products.csv")
-    _write_csv(products_path, ["product_id", "name", "category", "cost", "price"], products)
+    _write_csv(
+        products_path, ["product_id", "name", "category", "cost", "price"], products
+    )
 
     # ── customers.csv ─────────────────────────────────────────────────
     regions = ["North", "South", "East", "West"]
     customers = []
     for i in range(1, 51):
         joined = date(2023, 1, 1) + timedelta(days=random.randint(0, 365))
-        customers.append([
-            i, f"Customer-{i:03d}", f"cust{i}@example.com",
-            regions[i % 4], joined.isoformat(),
-        ])
+        customers.append(
+            [
+                i,
+                f"Customer-{i:03d}",
+                f"cust{i}@example.com",
+                regions[i % 4],
+                joined.isoformat(),
+            ]
+        )
     customers_path = os.path.join(DATA_DIR, "customers.csv")
-    _write_csv(customers_path, ["customer_id", "name", "email", "region", "joined_at"], customers)
+    _write_csv(
+        customers_path,
+        ["customer_id", "name", "email", "region", "joined_at"],
+        customers,
+    )
 
     # ── order_lines.csv ────────────────────────────────────────────────
     # 3 months of daily orders, more on weekends
@@ -86,25 +103,50 @@ def generate_data() -> dict[str, str]:
                 product_id = random.randint(1, 25)
                 qty = random.randint(1, 5)
                 discount = random.choice([0, 0, 0, 5, 10, 15])
-                order_lines.append([
-                    line_id, order_date.isoformat(), customer_id,
-                    product_id, qty, discount,
-                ])
+                order_lines.append(
+                    [
+                        line_id,
+                        order_date.isoformat(),
+                        customer_id,
+                        product_id,
+                        qty,
+                        discount,
+                    ]
+                )
                 line_id += 1
 
     lines_path = os.path.join(DATA_DIR, "order_lines.csv")
-    _write_csv(lines_path, ["line_id", "order_date", "customer_id", "product_id", "quantity", "discount_pct"], order_lines)
+    _write_csv(
+        lines_path,
+        [
+            "line_id",
+            "order_date",
+            "customer_id",
+            "product_id",
+            "quantity",
+            "discount_pct",
+        ],
+        order_lines,
+    )
 
     # ── returns.csv ───────────────────────────────────────────────────
     returns = []
     for i in range(1, random.randint(30, 60) + 1):
         line = random.choice(order_lines)
-        return_date = date.fromisoformat(line[1]) + timedelta(days=random.randint(1, 14))
-        reason = random.choice(["defective", "wrong_size", "changed_mind", "late_delivery"])
+        return_date = date.fromisoformat(line[1]) + timedelta(
+            days=random.randint(1, 14)
+        )
+        reason = random.choice(
+            ["defective", "wrong_size", "changed_mind", "late_delivery"]
+        )
         refund = round(random.uniform(5, 50), 2)
         returns.append([i, line[0], return_date.isoformat(), reason, refund])
     returns_path = os.path.join(DATA_DIR, "returns.csv")
-    _write_csv(returns_path, ["return_id", "line_id", "return_date", "reason", "refund_amount"], returns)
+    _write_csv(
+        returns_path,
+        ["return_id", "line_id", "return_date", "reason", "refund_amount"],
+        returns,
+    )
 
     print("Generated CSV data:")
     print(f"  products:     {len(products):>5} rows")
@@ -126,7 +168,9 @@ def generate_data() -> dict[str, str]:
 def _run_pipeline(runner: PipelineRunner, pipeline: Pipeline) -> dict:
     """Run a pipeline, assert success, and return the result."""
     result = runner.run(pipeline)
-    assert result["status"] == "success", f"Pipeline '{pipeline.name}' failed: {result['error']}"
+    assert (
+        result["status"] == "success"
+    ), f"Pipeline '{pipeline.name}' failed: {result['error']}"
     return result
 
 
@@ -191,8 +235,12 @@ def test_silver_clean(storage: DuckLakeStorage) -> None:
         ],
         destination_name="products",
         destination_layer="silver",
-        quality_rules=[no_nulls("product_id"), unique_column("product_id"),
-                       column_positive("price"), column_positive("cost")],
+        quality_rules=[
+            no_nulls("product_id"),
+            unique_column("product_id"),
+            column_positive("price"),
+            column_positive("cost"),
+        ],
     )
     _run_pipeline(runner, pipeline)
 
@@ -211,7 +259,11 @@ def test_silver_clean(storage: DuckLakeStorage) -> None:
         ],
         destination_name="customers",
         destination_layer="silver",
-        quality_rules=[no_nulls("customer_id"), no_nulls("email"), unique_column("customer_id")],
+        quality_rules=[
+            no_nulls("customer_id"),
+            no_nulls("email"),
+            unique_column("customer_id"),
+        ],
     )
     _run_pipeline(runner, pipeline)
 
@@ -244,8 +296,12 @@ def test_silver_clean(storage: DuckLakeStorage) -> None:
         ],
         destination_name="order_lines",
         destination_layer="silver",
-        quality_rules=[no_nulls("line_id"), no_nulls("order_date"),
-                       column_positive("net_amount"), min_row_count(100)],
+        quality_rules=[
+            no_nulls("line_id"),
+            no_nulls("order_date"),
+            column_positive("net_amount"),
+            min_row_count(100),
+        ],
     )
     _run_pipeline(runner, pipeline)
 
@@ -265,7 +321,11 @@ def test_silver_clean(storage: DuckLakeStorage) -> None:
         ],
         destination_name="returns",
         destination_layer="silver",
-        quality_rules=[no_nulls("return_id"), no_nulls("reason"), column_positive("refund_amount")],
+        quality_rules=[
+            no_nulls("return_id"),
+            no_nulls("reason"),
+            column_positive("refund_amount"),
+        ],
     )
     _run_pipeline(runner, pipeline)
 
@@ -323,8 +383,12 @@ def test_gold_aggregates(storage: DuckLakeStorage) -> None:
         ],
         destination_name="daily_category_revenue",
         destination_layer="gold",
-        quality_rules=[no_nulls("order_date"), no_nulls("category"),
-                       column_positive("revenue"), min_row_count(10)],
+        quality_rules=[
+            no_nulls("order_date"),
+            no_nulls("category"),
+            column_positive("revenue"),
+            min_row_count(10),
+        ],
     )
     _run_pipeline(runner, pipeline)
 
@@ -370,7 +434,11 @@ def test_gold_aggregates(storage: DuckLakeStorage) -> None:
         ],
         destination_name="customer_lifetime_value",
         destination_layer="gold",
-        quality_rules=[no_nulls("customer_id"), unique_column("customer_id"), min_row_count(10)],
+        quality_rules=[
+            no_nulls("customer_id"),
+            unique_column("customer_id"),
+            min_row_count(10),
+        ],
     )
     _run_pipeline(runner, pipeline)
 
@@ -410,7 +478,11 @@ def test_gold_aggregates(storage: DuckLakeStorage) -> None:
         ],
         destination_name="product_performance",
         destination_layer="gold",
-        quality_rules=[no_nulls("product_id"), unique_column("product_id"), column_positive("total_revenue")],
+        quality_rules=[
+            no_nulls("product_id"),
+            unique_column("product_id"),
+            column_positive("total_revenue"),
+        ],
     )
     _run_pipeline(runner, pipeline)
 
@@ -464,9 +536,16 @@ def test_preview_all(storage: DuckLakeStorage) -> None:
     print(f"\n  {'Layer':<10} {'Name':<30} {'Rows':>6}  Pipeline")
     print(f"  {'─'*10} {'─'*30} {'─'*6}  {'─'*30}")
     for ds in datasets:
-        print(f"  {ds['layer']:<10} {ds['name']:<30} {ds['row_count']:>6}  {ds.get('pipeline', '—')}")
+        print(
+            f"  {ds['layer']:<10} {ds['name']:<30} {ds['row_count']:>6}  {ds.get('pipeline', '—')}"
+        )
 
-    for name in ["daily_category_revenue", "customer_lifetime_value", "product_performance", "regional_summary"]:
+    for name in [
+        "daily_category_revenue",
+        "customer_lifetime_value",
+        "product_performance",
+        "regional_summary",
+    ]:
         try:
             df = storage.read(name, "gold").fetchdf()
             print(f"\n  gold.{name} — {len(df)} rows, {len(df.columns)} columns")
@@ -500,6 +579,7 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"\n❌ Failed: {e}")
         import traceback
+
         traceback.print_exc()
         sys.exit(1)
     finally:

@@ -30,7 +30,9 @@ from quality.checker import column_positive, min_row_count, no_nulls, unique_col
 from storage.ducklake import DuckLakeStorage
 
 # ── Config ────────────────────────────────────────────────────────────
-PG_CONN = "host=localhost port=5433 dbname=restaurant user=duckle password=duckle_secret"
+PG_CONN = (
+    "host=localhost port=5433 dbname=restaurant user=duckle password=duckle_secret"
+)
 
 
 # ── Helpers ────────────────────────────────────────────────────────────
@@ -51,7 +53,9 @@ def wait_for_postgres(conn: str, timeout: int = 30) -> bool:
 def _run_pipeline(runner: PipelineRunner, pipeline: Pipeline) -> dict:
     """Run a pipeline, assert success, and return the result."""
     result = runner.run(pipeline)
-    assert result["status"] == "success", f"Pipeline '{pipeline.name}' failed: {result['error']}"
+    assert (
+        result["status"] == "success"
+    ), f"Pipeline '{pipeline.name}' failed: {result['error']}"
     return result
 
 
@@ -72,10 +76,10 @@ def test_bronze_ingest() -> DuckLakeStorage:
     runner = PipelineRunner(storage=storage)
 
     tables = {
-        "menu_items":  "SELECT * FROM menu_items",
-        "customers":   "SELECT * FROM customers",
-        "orders":       "SELECT * FROM orders",
-        "order_items":  "SELECT * FROM order_items",
+        "menu_items": "SELECT * FROM menu_items",
+        "customers": "SELECT * FROM customers",
+        "orders": "SELECT * FROM orders",
+        "order_items": "SELECT * FROM order_items",
     }
 
     for name, query in tables.items():
@@ -124,7 +128,11 @@ def test_silver_clean(storage: DuckLakeStorage) -> None:
         ],
         destination_name="menu_items",
         destination_layer="silver",
-        quality_rules=[no_nulls("menu_item_id"), unique_column("menu_item_id"), column_positive("price")],
+        quality_rules=[
+            no_nulls("menu_item_id"),
+            unique_column("menu_item_id"),
+            column_positive("price"),
+        ],
     )
     _run_pipeline(runner, pipeline)
 
@@ -143,8 +151,12 @@ def test_silver_clean(storage: DuckLakeStorage) -> None:
         ],
         destination_name="customers",
         destination_layer="silver",
-        quality_rules=[no_nulls("customer_id"), no_nulls("email"),
-                       unique_column("email"), min_row_count(30)],
+        quality_rules=[
+            no_nulls("customer_id"),
+            no_nulls("email"),
+            unique_column("email"),
+            min_row_count(30),
+        ],
     )
     _run_pipeline(runner, pipeline)
 
@@ -164,8 +176,12 @@ def test_silver_clean(storage: DuckLakeStorage) -> None:
         ],
         destination_name="orders",
         destination_layer="silver",
-        quality_rules=[no_nulls("order_id"), no_nulls("order_date"),
-                       unique_column("order_id"), min_row_count(100)],
+        quality_rules=[
+            no_nulls("order_id"),
+            no_nulls("order_date"),
+            unique_column("order_id"),
+            min_row_count(100),
+        ],
     )
     _run_pipeline(runner, pipeline)
 
@@ -195,9 +211,13 @@ def test_silver_clean(storage: DuckLakeStorage) -> None:
         ],
         destination_name="order_items",
         destination_layer="silver",
-        quality_rules=[no_nulls("order_item_id"), no_nulls("order_id"),
-                       column_positive("quantity"), column_positive("line_total"),
-                       min_row_count(100)],
+        quality_rules=[
+            no_nulls("order_item_id"),
+            no_nulls("order_id"),
+            column_positive("quantity"),
+            column_positive("line_total"),
+            min_row_count(100),
+        ],
     )
     _run_pipeline(runner, pipeline)
 
@@ -257,8 +277,12 @@ def test_gold_aggregates(storage: DuckLakeStorage) -> None:
         ],
         destination_name="daily_category_revenue",
         destination_layer="gold",
-        quality_rules=[no_nulls("order_date"), no_nulls("category"),
-                       column_positive("revenue"), min_row_count(10)],
+        quality_rules=[
+            no_nulls("order_date"),
+            no_nulls("category"),
+            column_positive("revenue"),
+            min_row_count(10),
+        ],
     )
     _run_pipeline(runner, pipeline)
 
@@ -307,7 +331,11 @@ def test_gold_aggregates(storage: DuckLakeStorage) -> None:
         ],
         destination_name="customer_spending",
         destination_layer="gold",
-        quality_rules=[no_nulls("customer_id"), unique_column("customer_id"), min_row_count(10)],
+        quality_rules=[
+            no_nulls("customer_id"),
+            unique_column("customer_id"),
+            min_row_count(10),
+        ],
     )
     _run_pipeline(runner, pipeline)
 
@@ -346,8 +374,11 @@ def test_gold_aggregates(storage: DuckLakeStorage) -> None:
         ],
         destination_name="menu_item_performance",
         destination_layer="gold",
-        quality_rules=[no_nulls("menu_item_id"), unique_column("menu_item_id"),
-                       column_positive("total_revenue")],
+        quality_rules=[
+            no_nulls("menu_item_id"),
+            unique_column("menu_item_id"),
+            column_positive("total_revenue"),
+        ],
     )
     _run_pipeline(runner, pipeline)
 
@@ -401,9 +432,16 @@ def test_preview_all(storage: DuckLakeStorage) -> None:
     print(f"\n  {'Layer':<10} {'Name':<30} {'Rows':>6}  Pipeline")
     print(f"  {'─'*10} {'─'*30} {'─'*6}  {'─'*30}")
     for ds in datasets:
-        print(f"  {ds['layer']:<10} {ds['name']:<30} {ds['row_count']:>6}  {ds.get('pipeline', '—')}")
+        print(
+            f"  {ds['layer']:<10} {ds['name']:<30} {ds['row_count']:>6}  {ds.get('pipeline', '—')}"
+        )
 
-    for name in ["daily_category_revenue", "customer_spending", "menu_item_performance", "weekend_vs_weekday"]:
+    for name in [
+        "daily_category_revenue",
+        "customer_spending",
+        "menu_item_performance",
+        "weekend_vs_weekday",
+    ]:
         try:
             df = storage.read(name, "gold").fetchdf()
             print(f"\n  gold.{name} — {len(df)} rows, {len(df.columns)} columns")
@@ -432,6 +470,7 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"\n❌ Failed: {e}")
         import traceback
+
         traceback.print_exc()
         sys.exit(1)
     finally:

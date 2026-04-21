@@ -19,9 +19,7 @@ class TestCSVConnector:
     def test_extract_correct_data(self, duck_conn, sample_csv):
         connector = CSVConnector(sample_csv)
         connector.extract(duck_conn, "raw")
-        row = duck_conn.execute(
-            "SELECT SUM(amount) FROM raw"
-        ).fetchone()
+        row = duck_conn.execute("SELECT SUM(amount) FROM raw").fetchone()
         assert row[0] == 1000  # 100+200+150+300+250
 
     def test_test_connection_exists(self, sample_csv):

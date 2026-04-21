@@ -24,14 +24,20 @@ class Transformer:
         Run a list of SQL transform steps.
         Returns the name of the final output table.
         """
+        if not steps:
+            raise ValueError("Must provide step")
+
         if source_table is not None:
             source_table = safe_identifier(source_table, label="source_table")
-        current_table = source_table
+
+        current_table: Optional[str] = source_table
+        final_table: str = ""
 
         for i, sql in enumerate(steps):
             output_table = safe_identifier(f"_transform_step_{i}", label="output_table")
-            # Allow referencing previous step via {{input}} placeholder
-            resolved_sql = sql.replace("{{input}}", current_table) if current_table else sql
+            resolved_sql = (
+                sql.replace("{{input}}", current_table) if current_table else sql
+            )
             self.conn.execute(
                 f"CREATE OR REPLACE TABLE {output_table} AS {resolved_sql}"
             )
@@ -41,8 +47,8 @@ class Transformer:
             count = result[0] if result is not None else 0
             print(f"[Transformer] Step {i + 1}: {count} rows → {output_table}")
             current_table = output_table
-
-        return current_table
+            final_table = output_table
+        return final_table
 
     def preview(self, table: str, limit: int = 5) -> list:
         """Return a sample of rows from a table."""

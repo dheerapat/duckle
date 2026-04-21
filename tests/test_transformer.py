@@ -6,9 +6,7 @@ from engine.transformer import Transformer
 
 class TestTransformer:
     def test_single_step(self, duck_conn):
-        duck_conn.execute(
-            "CREATE TABLE raw AS SELECT 1 AS id, 'Alice' AS name"
-        )
+        duck_conn.execute("CREATE TABLE raw AS SELECT 1 AS id, 'Alice' AS name")
         t = Transformer(duck_conn)
         result = t.run(["SELECT id, name FROM {{input}}"], "raw")
         rows = duck_conn.execute(f"SELECT * FROM {result}").fetchall()
@@ -16,9 +14,7 @@ class TestTransformer:
         assert rows[0][1] == "Alice"
 
     def test_multi_step(self, duck_conn):
-        duck_conn.execute(
-            "CREATE TABLE raw AS SELECT 10 AS amount UNION ALL SELECT 20"
-        )
+        duck_conn.execute("CREATE TABLE raw AS SELECT 10 AS amount UNION ALL SELECT 20")
         t = Transformer(duck_conn)
         result = t.run(
             [
@@ -36,9 +32,7 @@ class TestTransformer:
             t.run(["SELECT 1"], "bad name; DROP TABLE--")
 
     def test_preview(self, duck_conn):
-        duck_conn.execute(
-            "CREATE TABLE raw AS SELECT range AS id FROM range(10)"
-        )
+        duck_conn.execute("CREATE TABLE raw AS SELECT range AS id FROM range(10)")
         t = Transformer(duck_conn)
         result = t.preview("raw", limit=3)
         assert len(result) == 3

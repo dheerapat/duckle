@@ -43,9 +43,7 @@ class TableConnector(BaseConnector):
     def extract(self, conn: duckdb.DuckDBPyConnection, table_name: str) -> None:
         table_name = safe_identifier(table_name, label="table_name")
         source = _resolve_table_ref(self.source_table)
-        conn.execute(
-            f"CREATE OR REPLACE TABLE {table_name} AS SELECT * FROM {source}"
-        )
+        conn.execute(f"CREATE OR REPLACE TABLE {table_name} AS SELECT * FROM {source}")
         result = conn.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()
         count = result[0] if result is not None else 0
         print(f"[TableConnector] Copied {count} rows from {source} → {table_name}")

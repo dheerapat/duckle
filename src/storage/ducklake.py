@@ -7,6 +7,7 @@ managed by DuckLake (supports time-travel, updates, deletes, etc.).
 
 Bronze / Silver / Gold layers are implemented as DuckLake schemas.
 """
+
 import os
 from datetime import datetime, timezone
 from typing import Optional
@@ -25,9 +26,15 @@ class DuckLakeStorage:
     LAYERS = ["bronze", "silver", "gold"]
 
     def __init__(self):
-        self.catalog_path = os.environ.get("DUCKLAKE_CATALOG_PATH", "./lake/ducklake.ducklake")
-        self.ducklake_path = os.environ.get("DUCKLAKE_DATA_PATH", "./lake/ducklake.files")
-        self.metadata_path = os.environ.get("DUCKLAKE_METADATA_PATH", "./lake/_metadata.db")
+        self.catalog_path = os.environ.get(
+            "DUCKLAKE_CATALOG_PATH", "./lake/ducklake.ducklake"
+        )
+        self.ducklake_path = os.environ.get(
+            "DUCKLAKE_DATA_PATH", "./lake/ducklake.files"
+        )
+        self.metadata_path = os.environ.get(
+            "DUCKLAKE_METADATA_PATH", "./lake/_metadata.db"
+        )
         self.conn: duckdb.DuckDBPyConnection
         self._meta_conn: duckdb.DuckDBPyConnection
         self._ensure_paths()
@@ -107,15 +114,12 @@ class DuckLakeStorage:
         table = safe_identifier(table, label="table")
         safe_name = safe_identifier(name, label="dataset name")
 
-        result = self.conn.execute(
-            f"SELECT COUNT(*) FROM {table}"
-        ).fetchone()
+        result = self.conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()
         count = result[0] if result is not None else 0
 
         # Direct in-connection write — no temp file, no cross-connection copy
         self.conn.execute(
-            f"CREATE OR REPLACE TABLE {layer}.{safe_name} "
-            f"AS SELECT * FROM {table}"
+            f"CREATE OR REPLACE TABLE {layer}.{safe_name} " f"AS SELECT * FROM {table}"
         )
 
         now = datetime.now(timezone.utc)
@@ -149,9 +153,9 @@ class DuckLakeStorage:
 
     def snapshots(self) -> list[dict]:
         """Return all DuckLake snapshots for the catalog (time-travel history)."""
-        return self.conn.execute(
-            "FROM ducklake.snapshots()"
-        ).fetchdf().to_dict("records")
+        return (
+            self.conn.execute("FROM ducklake.snapshots()").fetchdf().to_dict("records")
+        )
 
     def read_at_version(
         self, name: str, layer: str = "gold", version: int = 0

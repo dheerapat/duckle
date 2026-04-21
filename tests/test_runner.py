@@ -84,9 +84,7 @@ class TestPipelineRunner:
 
         pipeline = Pipeline(
             name="conn_fail",
-            source=PostgresConnector(
-                "host=nonexistent dbname=test", "SELECT 1"
-            ),
+            source=PostgresConnector("host=nonexistent dbname=test", "SELECT 1"),
             transforms=["SELECT 1"],
             destination_name="conn_fail_out",
             destination_layer="gold",
