@@ -1,6 +1,6 @@
 # Duckle 🦆
 
-A lightweight ETL platform for small companies, powered by DuckDB + DuckLake.
+A lightweight data engineering platform for small companies, powered by DuckDB + DuckLake.
 
 ## Philosophy
 - No clusters. No servers. Just a process.
