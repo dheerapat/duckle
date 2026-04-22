@@ -1,6 +1,7 @@
 import re
 
 import duckdb
+from typing import Optional
 from connectors.base import BaseConnector
 from utils.sql_safety import safe_identifier, safe_path
 
@@ -71,17 +72,26 @@ class PostgresConnector(BaseConnector):
         table_name: str,
         cursor_column: str,
         since_value: str,
+        until_value: Optional[str] = None,
+        from_is_explicit: bool = False,
     ) -> None:
         self._attach(conn)
         self._validate_cursor_value(since_value)
+        if until_value is not None:
+            self._validate_cursor_value(until_value)
         safe_col = safe_identifier(cursor_column, label="cursor_column")
         safe_tbl = safe_identifier(table_name, label="table_name")
 
-        # postgres_query parameterises the whole query string, so we embed
-        # the validated cursor value directly.
-        filtered_query = (
-            f"SELECT * FROM ({self.query}) AS _src WHERE {safe_col} > '{since_value}'"
-        )
+        op = ">=" if from_is_explicit else ">"
+        if until_value is not None:
+            filtered_query = (
+                f"SELECT * FROM ({self.query}) AS _src "
+                f"WHERE {safe_col} {op} '{since_value}' AND {safe_col} < '{until_value}'"
+            )
+        else:
+            filtered_query = (
+                f"SELECT * FROM ({self.query}) AS _src WHERE {safe_col} {op} '{since_value}'"
+            )
         conn.execute(
             f"CREATE OR REPLACE TABLE {safe_tbl} AS "
             f"SELECT * FROM postgres_query('{_PG_ALIAS}', ?)",

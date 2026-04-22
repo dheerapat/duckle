@@ -452,6 +452,261 @@ class TestIncrementalPipeline:
         assert result[0] == 2
         conn.close()
 
+    # ------------------------------------------------------------------
+    # Explicit range tests
+    # ------------------------------------------------------------------
+
+    def test_explicit_range(self, ducklake_storage):
+        """Explicit from + to extracts [from, to) range."""
+        conn = ducklake_storage.conn
+        conn.execute(
+            "CREATE TABLE src_orders AS SELECT * FROM (VALUES (1, 100, '2024-01-01'), (2, 200, '2024-01-15'), (3, 300, '2024-02-01')) t(order_id, amount, order_date)"
+        )
+
+        pipeline = Pipeline(
+            name="inc_range",
+            source=TableConnector("src_orders"),
+            transforms=["SELECT * FROM {{input}}"],
+            destination_name="orders_range",
+            destination_layer="gold",
+            incremental=IncrementalConfig(
+                cursor_column="order_date",
+                merge_keys=["order_id"],
+                from_value="2024-01-01",
+                to_value="2024-02-01",
+            ),
+        )
+        runner = PipelineRunner(storage=ducklake_storage)
+        result = runner.run(pipeline)
+
+        assert result["status"] == "success"
+        df = ducklake_storage.read("orders_range", "gold").fetchdf()
+        assert len(df) == 2
+        assert set(df["order_id"].tolist()) == {1, 2}
+
+        state = ducklake_storage.get_pipeline_state("orders_range", "gold")
+        assert state["last_cursor_value"] == "2024-01-15"
+
+    def test_to_value_only(self, ducklake_storage):
+        """to_value only uses stored cursor as floor, explicit to as ceiling."""
+        conn = ducklake_storage.conn
+        conn.execute(
+            "CREATE TABLE src_orders AS SELECT * FROM (VALUES (1, 100, '2024-01-01'), (2, 200, '2024-01-15'), (3, 300, '2024-02-01')) t(order_id, amount, order_date)"
+        )
+
+        pipeline = Pipeline(
+            name="inc_to_only",
+            source=TableConnector("src_orders"),
+            transforms=["SELECT * FROM {{input}}"],
+            destination_name="orders_to_only",
+            destination_layer="gold",
+            incremental=IncrementalConfig(
+                cursor_column="order_date",
+                merge_keys=["order_id"],
+            ),
+        )
+        runner = PipelineRunner(storage=ducklake_storage)
+        runner.run(pipeline)  # cursor = 2024-02-01
+
+        conn.execute(
+            "INSERT INTO src_orders VALUES (4, 400, '2024-02-15'), (5, 500, '2024-03-01')"
+        )
+
+        pipeline2 = Pipeline(
+            name="inc_to_only",
+            source=TableConnector("src_orders"),
+            transforms=["SELECT * FROM {{input}}"],
+            destination_name="orders_to_only",
+            destination_layer="gold",
+            incremental=IncrementalConfig(
+                cursor_column="order_date",
+                merge_keys=["order_id"],
+                to_value="2024-03-01",
+            ),
+        )
+        result = runner.run(pipeline2)
+        assert result["status"] == "success"
+        df = ducklake_storage.read("orders_to_only", "gold").fetchdf()
+        assert len(df) == 4
+        assert 5 not in df["order_id"].tolist()
+
+    def test_from_value_less_than_stored_cursor(self, ducklake_storage):
+        """Explicit from < stored cursor: re-processes rows, MERGE deduplicates."""
+        conn = ducklake_storage.conn
+        conn.execute(
+            "CREATE TABLE src_orders AS SELECT * FROM (VALUES (1, 100, '2024-01-01'), (2, 200, '2024-01-15')) t(order_id, amount, order_date)"
+        )
+
+        pipeline = Pipeline(
+            name="inc_backfill",
+            source=TableConnector("src_orders"),
+            transforms=["SELECT * FROM {{input}}"],
+            destination_name="orders_backfill",
+            destination_layer="gold",
+            incremental=IncrementalConfig(
+                cursor_column="order_date",
+                merge_keys=["order_id"],
+            ),
+        )
+        runner = PipelineRunner(storage=ducklake_storage)
+        runner.run(pipeline)  # cursor = 2024-01-15
+
+        conn.execute("UPDATE src_orders SET amount = 999 WHERE order_id = 1")
+        pipeline2 = Pipeline(
+            name="inc_backfill",
+            source=TableConnector("src_orders"),
+            transforms=["SELECT * FROM {{input}}"],
+            destination_name="orders_backfill",
+            destination_layer="gold",
+            incremental=IncrementalConfig(
+                cursor_column="order_date",
+                merge_keys=["order_id"],
+                from_value="2024-01-01",
+            ),
+        )
+        result = runner.run(pipeline2)
+        assert result["status"] == "success"
+        df = ducklake_storage.read("orders_backfill", "gold").fetchdf()
+        assert len(df) == 2
+        assert df[df["order_id"] == 1]["amount"].iloc[0] == 999
+
+    def test_empty_result_in_range(self, ducklake_storage):
+        """No rows in range → cursor should NOT advance."""
+        conn = ducklake_storage.conn
+        conn.execute(
+            "CREATE TABLE src_orders AS SELECT * FROM (VALUES (1, 100, '2024-01-01')) t(order_id, amount, order_date)"
+        )
+
+        pipeline = Pipeline(
+            name="inc_empty",
+            source=TableConnector("src_orders"),
+            transforms=["SELECT * FROM {{input}}"],
+            destination_name="orders_empty",
+            destination_layer="gold",
+            incremental=IncrementalConfig(
+                cursor_column="order_date",
+                merge_keys=["order_id"],
+            ),
+        )
+        runner = PipelineRunner(storage=ducklake_storage)
+        runner.run(pipeline)  # cursor = 2024-01-01
+
+        pipeline2 = Pipeline(
+            name="inc_empty",
+            source=TableConnector("src_orders"),
+            transforms=["SELECT * FROM {{input}}"],
+            destination_name="orders_empty",
+            destination_layer="gold",
+            incremental=IncrementalConfig(
+                cursor_column="order_date",
+                merge_keys=["order_id"],
+                from_value="2025-01-01",
+                to_value="2025-02-01",
+            ),
+        )
+        result = runner.run(pipeline2)
+        assert result["status"] == "success"
+        state = ducklake_storage.get_pipeline_state("orders_empty", "gold")
+        assert state["last_cursor_value"] == "2024-01-01"
+
+    def test_full_refresh_ignores_range(self, ducklake_storage):
+        """full_refresh=True ignores explicit bounds."""
+        conn = ducklake_storage.conn
+        conn.execute(
+            "CREATE TABLE src_orders AS SELECT * FROM (VALUES (1, 100, '2024-01-01'), (2, 200, '2024-01-15'), (3, 300, '2024-02-01')) t(order_id, amount, order_date)"
+        )
+
+        pipeline = Pipeline(
+            name="inc_refresh",
+            source=TableConnector("src_orders"),
+            transforms=["SELECT * FROM {{input}}"],
+            destination_name="orders_refresh",
+            destination_layer="gold",
+            incremental=IncrementalConfig(
+                cursor_column="order_date",
+                merge_keys=["order_id"],
+                from_value="2024-01-01",
+                to_value="2024-02-01",
+            ),
+        )
+        runner = PipelineRunner(storage=ducklake_storage)
+        result = runner.run(pipeline, full_refresh=True)
+        assert result["status"] == "success"
+        df = ducklake_storage.read("orders_refresh", "gold").fetchdf()
+        assert len(df) == 3
+
+    def test_backfill_then_resume(self, ducklake_storage):
+        """After a backfill, next incremental run resumes from max cursor of that batch."""
+        conn = ducklake_storage.conn
+        conn.execute(
+            "CREATE TABLE src_orders AS SELECT * FROM (VALUES (1, 100, '2024-01-01'), (2, 200, '2024-01-15'), (3, 300, '2024-02-01')) t(order_id, amount, order_date)"
+        )
+
+        pipeline = Pipeline(
+            name="inc_resume",
+            source=TableConnector("src_orders"),
+            transforms=["SELECT * FROM {{input}}"],
+            destination_name="orders_resume",
+            destination_layer="gold",
+            incremental=IncrementalConfig(
+                cursor_column="order_date",
+                merge_keys=["order_id"],
+            ),
+        )
+        runner = PipelineRunner(storage=ducklake_storage)
+        runner.run(pipeline)  # cursor = 2024-02-01
+
+        pipeline_backfill = Pipeline(
+            name="inc_resume",
+            source=TableConnector("src_orders"),
+            transforms=["SELECT * FROM {{input}}"],
+            destination_name="orders_resume",
+            destination_layer="gold",
+            incremental=IncrementalConfig(
+                cursor_column="order_date",
+                merge_keys=["order_id"],
+                from_value="2024-01-01",
+                to_value="2024-02-01",
+            ),
+        )
+        result = runner.run(pipeline_backfill)
+        assert result["status"] == "success"
+        # Cursor should be max of Jan data
+        state = ducklake_storage.get_pipeline_state("orders_resume", "gold")
+        assert state["last_cursor_value"] == "2024-01-15"
+
+        conn.execute("INSERT INTO src_orders VALUES (4, 400, '2024-03-01')")
+        result = runner.run(pipeline)
+        assert result["status"] == "success"
+        df = ducklake_storage.read("orders_resume", "gold").fetchdf()
+        assert len(df) == 4
+
+    def test_equal_from_to_empty_range(self, ducklake_storage):
+        """from_value == to_value is an empty range."""
+        conn = ducklake_storage.conn
+        conn.execute(
+            "CREATE TABLE src_orders AS SELECT * FROM (VALUES (1, 100, '2024-01-01')) t(order_id, amount, order_date)"
+        )
+
+        pipeline = Pipeline(
+            name="inc_equal",
+            source=TableConnector("src_orders"),
+            transforms=["SELECT * FROM {{input}}"],
+            destination_name="orders_equal",
+            destination_layer="gold",
+            incremental=IncrementalConfig(
+                cursor_column="order_date",
+                merge_keys=["order_id"],
+                from_value="2024-01-01",
+                to_value="2024-01-01",
+            ),
+        )
+        runner = PipelineRunner(storage=ducklake_storage)
+        result = runner.run(pipeline)
+        assert result["status"] == "success"
+        df = ducklake_storage.read("orders_equal", "gold").fetchdf()
+        assert len(df) == 0
+
     def test_pipeline_rejects_empty_merge_keys(self):
         with pytest.raises(ValueError, match="merge_keys"):
             Pipeline(

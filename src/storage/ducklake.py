@@ -199,6 +199,16 @@ class DuckLakeStorage:
 
         now = datetime.now(timezone.utc)
         merge_keys_str = ",".join(merge_keys)
+
+        # Preserve existing cursor metadata so update_pipeline_cursor remains the
+        # single source of truth for cursor state.
+        existing = self._meta_conn.execute(
+            "SELECT cursor_column, last_cursor_value FROM _metadata WHERE id = ?",
+            [f"{layer}/{safe_name}"],
+        ).fetchone()
+        cursor_column = existing[0] if existing is not None else None
+        last_cursor_value = existing[1] if existing is not None else None
+
         self._meta_conn.execute(
             """
             INSERT OR REPLACE INTO _metadata
@@ -211,8 +221,8 @@ class DuckLakeStorage:
                 count,
                 now,
                 pipeline,
-                None,
-                None,
+                cursor_column,
+                last_cursor_value,
                 merge_keys_str,
                 "incremental",
             ],

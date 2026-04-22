@@ -25,7 +25,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from connectors.postgres_connector import PostgresConnector
 from connectors.table_connector import TableConnector
-from orchestrator.runner import Pipeline, PipelineRunner
+from orchestrator.runner import IncrementalConfig, Pipeline, PipelineRunner
 from quality.checker import column_positive, min_row_count, no_nulls, unique_column
 from storage.ducklake import DuckLakeStorage
 
@@ -419,6 +419,86 @@ def test_gold_aggregates(storage: DuckLakeStorage) -> None:
     print("✅ Gold aggregates complete")
 
 
+# ── Incremental range demo ─────────────────────────────────────────────
+
+
+def test_incremental_range_demo(storage: DuckLakeStorage) -> None:
+    """Demonstrate explicit [from, to) incremental range loading."""
+    print("\n" + "=" * 60)
+    print("STEP 4 — Incremental range demo")
+    print("=" * 60)
+
+    runner = PipelineRunner(storage=storage)
+
+    row = storage.conn.execute(
+        """
+        SELECT MIN(order_date)::VARCHAR, MAX(order_date)::VARCHAR,
+               (MIN(order_date) + ((MAX(order_date) - MIN(order_date)) / 2)::INTEGER)::VARCHAR
+        FROM silver.orders
+        """
+    ).fetchone()
+    assert row is not None
+    min_date, max_date, mid_date = row
+
+    print(f"\n  orders date range: {min_date} to {max_date}")
+    print(f"  → Backfill first half: [{min_date}, {mid_date})")
+
+    # --- Backfill: explicit range [min, mid) ---
+    pipeline = Pipeline(
+        name="pg_inc_range_backfill",
+        source=TableConnector("silver.orders"),
+        transforms=[
+            """
+            SELECT order_date, COUNT(*) AS order_count,
+                   COUNT(DISTINCT customer_id) AS unique_customers
+            FROM {{input}}
+            GROUP BY order_date
+            """,
+        ],
+        destination_name="daily_orders",
+        destination_layer="gold",
+        incremental=IncrementalConfig(
+            cursor_column="order_date",
+            merge_keys=["order_date"],
+            from_value=min_date,
+            to_value=mid_date,
+        ),
+    )
+    result = runner.run(pipeline)
+    assert result["status"] == "success"
+
+    state = storage.get_pipeline_state("daily_orders", "gold")
+    assert state is not None
+    print(f"  Cursor after backfill: {state['last_cursor_value']}")
+
+    # --- Resume: no bounds, should load > cursor ---
+    print(f"  → Resume incremental: order_date > {state['last_cursor_value']}")
+    pipeline2 = Pipeline(
+        name="pg_inc_range_resume",
+        source=TableConnector("silver.orders"),
+        transforms=[
+            """
+            SELECT order_date, COUNT(*) AS order_count,
+                   COUNT(DISTINCT customer_id) AS unique_customers
+            FROM {{input}}
+            GROUP BY order_date
+            """,
+        ],
+        destination_name="daily_orders",
+        destination_layer="gold",
+        incremental=IncrementalConfig(
+            cursor_column="order_date",
+            merge_keys=["order_date"],
+        ),
+    )
+    result = runner.run(pipeline2)
+    assert result["status"] == "success"
+
+    df_final = storage.read("daily_orders", "gold").fetchdf()
+    print(f"  Final rows in daily_orders: {len(df_final)}")
+    print("✅ Incremental range demo complete")
+
+
 # ── Preview ────────────────────────────────────────────────────────────
 
 
@@ -466,6 +546,7 @@ if __name__ == "__main__":
         storage = test_bronze_ingest()
         test_silver_clean(storage)
         test_gold_aggregates(storage)
+        test_incremental_range_demo(storage)
         test_preview_all(storage)
     except Exception as e:
         print(f"\n❌ Failed: {e}")

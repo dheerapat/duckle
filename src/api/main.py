@@ -23,6 +23,8 @@ class IncrementalConfigModel(BaseModel):
     cursor_column: str
     merge_keys: list[str]
     default_full_refresh: bool = False
+    from_value: Optional[str] = None   # inclusive
+    to_value: Optional[str] = None     # exclusive
 
 
 class RunPipelineRequest(BaseModel):
@@ -116,6 +118,8 @@ def run_pipeline(req: RunPipelineRequest, full_refresh: bool = False):
                 cursor_column=req.incremental.cursor_column,
                 merge_keys=req.incremental.merge_keys,
                 default_full_refresh=req.incremental.default_full_refresh,
+                from_value=req.incremental.from_value,
+                to_value=req.incremental.to_value,
             )
 
         connector = _build_connector(req.source_type, req.source_config)

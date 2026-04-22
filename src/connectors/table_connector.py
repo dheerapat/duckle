@@ -5,6 +5,7 @@ PipelineRunner without needing a separate external source.
 """
 
 import duckdb
+from typing import Optional
 from connectors.base import BaseConnector
 from utils.sql_safety import safe_identifier
 
@@ -54,15 +55,25 @@ class TableConnector(BaseConnector):
         table_name: str,
         cursor_column: str,
         since_value: str,
+        until_value: Optional[str] = None,
+        from_is_explicit: bool = False,
     ) -> None:
         source = _resolve_table_ref(self.source_table)
         safe_col = safe_identifier(cursor_column, label="cursor_column")
         safe_tbl = safe_identifier(table_name, label="table_name")
-        conn.execute(
-            f"CREATE OR REPLACE TABLE {safe_tbl} AS "
-            f"SELECT * FROM {source} WHERE {safe_col} > ?",
-            [since_value],
-        )
+        op = ">=" if from_is_explicit else ">"
+        if until_value is not None:
+            conn.execute(
+                f"CREATE OR REPLACE TABLE {safe_tbl} AS "
+                f"SELECT * FROM {source} WHERE {safe_col} {op} ? AND {safe_col} < ?",
+                [since_value, until_value],
+            )
+        else:
+            conn.execute(
+                f"CREATE OR REPLACE TABLE {safe_tbl} AS "
+                f"SELECT * FROM {source} WHERE {safe_col} {op} ?",
+                [since_value],
+            )
         result = conn.execute(f"SELECT COUNT(*) FROM {safe_tbl}").fetchone()
         count = result[0] if result is not None else 0
         print(

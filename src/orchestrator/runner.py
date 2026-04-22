@@ -17,6 +17,10 @@ class IncrementalConfig:
     merge_keys: list[str]
     default_full_refresh: bool = False
 
+    # NEW — optional explicit bounds
+    from_value: Optional[str] = None   # inclusive floor
+    to_value: Optional[str] = None     # exclusive ceiling
+
 
 class Pipeline:
     """
@@ -89,20 +93,38 @@ class PipelineRunner:
 
         incremental = pipeline.incremental
         since_value: Optional[str] = None
+        until_value: Optional[str] = None
+        from_is_explicit = False
         run_mode = "full"
 
         if incremental is not None and not full_refresh:
-            since_value = self.storage.get_last_cursor(
-                pipeline.destination_name, pipeline.destination_layer
-            )
-            if since_value is not None:
+            # Resolve from_value: explicit > stored cursor > None
+            if incremental.from_value is not None:
+                since_value = incremental.from_value
+                from_is_explicit = True
                 run_mode = "incremental"
                 print(
-                    f"[Incremental] High-water mark: {incremental.cursor_column} > {since_value}"
+                    f"[Incremental] Explicit from: {incremental.cursor_column} >= {since_value}"
                 )
             else:
+                since_value = self.storage.get_last_cursor(
+                    pipeline.destination_name, pipeline.destination_layer
+                )
+                if since_value is not None:
+                    run_mode = "incremental"
+                    print(
+                        f"[Incremental] High-water mark: {incremental.cursor_column} > {since_value}"
+                    )
+                else:
+                    print(
+                        "[Incremental] No prior cursor found, falling back to full load."
+                    )
+
+            # Resolve to_value: explicit > None (no ceiling)
+            if incremental.to_value is not None:
+                until_value = incremental.to_value
                 print(
-                    "[Incremental] No prior cursor found, falling back to full load."
+                    f"[Incremental] Explicit to: {incremental.cursor_column} < {until_value}"
                 )
 
         try:
@@ -112,7 +134,12 @@ class PipelineRunner:
                 if run_mode == "incremental" and since_value is not None:
                     assert incremental is not None
                     connector.extract_incremental(
-                        conn, alias, incremental.cursor_column, since_value
+                        conn,
+                        alias,
+                        incremental.cursor_column,
+                        since_value,
+                        until_value=until_value,
+                        from_is_explicit=from_is_explicit,
                     )
                 else:
                     connector.extract(conn, alias)
@@ -182,15 +209,18 @@ class PipelineRunner:
                 ).fetchone()
                 assert row is not None
                 new_cursor = row[0]
-                self.storage.update_pipeline_cursor(
-                    pipeline.destination_name,
-                    pipeline.destination_layer,
-                    cursor_column=incremental.cursor_column,
-                    last_cursor_value=str(new_cursor) if new_cursor is not None else None,
-                    merge_keys=incremental.merge_keys,
-                    run_mode=run_mode,
-                )
-                print(f"[Incremental] Cursor updated to {new_cursor}")
+                if new_cursor is not None:
+                    self.storage.update_pipeline_cursor(
+                        pipeline.destination_name,
+                        pipeline.destination_layer,
+                        cursor_column=incremental.cursor_column,
+                        last_cursor_value=str(new_cursor),
+                        merge_keys=incremental.merge_keys,
+                        run_mode=run_mode,
+                    )
+                    print(f"[Incremental] Cursor updated to {new_cursor}")
+                else:
+                    print("[Incremental] No rows in range — cursor not advanced.")
 
         except Exception as e:
             run["status"] = "failed"
