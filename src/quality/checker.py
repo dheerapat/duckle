@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import List
+from typing import List, Optional
 
 import duckdb
 from utils.sql_safety import safe_identifier
@@ -19,10 +19,13 @@ class QualityChecker:
     def __init__(self, conn: duckdb.DuckDBPyConnection):
         self.conn = conn
 
-    def check(self, table: str, rules: List[QualityRule]) -> dict:
+    def check(self, table: str, rules: List[QualityRule], schema: Optional[str] = None) -> dict:
         results = []
         all_passed = True
         safe_table = safe_identifier(table, label="table")
+        if schema is not None:
+            safe_schema = safe_identifier(schema, label="schema")
+            safe_table = f"{safe_schema}.{safe_table}"
 
         for rule in rules:
             sql = rule.sql.replace("{{table}}", safe_table)

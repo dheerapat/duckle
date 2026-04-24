@@ -14,6 +14,7 @@ Duckle is a single-process ETL platform built on **DuckDB + DuckLake**. No Spark
 - Validate with built-in data quality rules
 - Load into Bronze → Silver → Gold layers with automatic MERGE upserts
 - Track incremental state (high-water mark cursors) out of the box
+- Gate data quality with **Write-Audit-Publish** (opt-in `wap_mode`) — write to staging, check quality, then publish
 
 ---
 
@@ -91,6 +92,7 @@ This script:
 | **Bronze** | Raw ingest, minimal change | `SELECT * FROM {{input}}` |
 | **Silver** | Cleaned, typed, enriched, deduped | `SELECT DISTINCT ... CAST(... AS DATE) ... JOIN` |
 | **Gold** | Business aggregations | `SELECT ... GROUP BY ... SUM(...) ... CASE WHEN` |
+| **Staging** | WAP transient layer (opt-in) | Data awaits quality gate before publish to bronze/silver/gold |
 
 ### Example: Bronze → Silver → Gold
 
@@ -269,6 +271,8 @@ QualityRule(
 ```
 
 > The `{{table}}` placeholder is replaced with the actual intermediate table name at runtime.
+>
+> **Tip:** When `wap_mode=True`, quality checks run against `staging.{destination_name}` instead of the intermediate transform table, so bad data is caught before it reaches the destination layer.
 
 ---
 
@@ -325,7 +329,85 @@ runner.run(pipeline, full_refresh=True)  # Ignores cursor, does CREATE OR REPLAC
 
 ---
 
+## 6. Write-Audit-Publish (WAP)
+
+WAP is an **opt-in** pattern that makes quality checks gate the final write. Instead of writing directly to the destination layer, the pipeline:
+
+1. Writes to `staging.{destination_name}`
+2. Runs quality checks against the staging table
+3. Only if all blocking checks pass → **publishes** to the destination layer
+4. Staging table is dropped on success, **left intact on failure** for debugging
+
+### When to use WAP
+
+- **Critical pipelines** where bad data must never land in gold
+- **Debugging data issues** — inspect the staging table after a failure
+- **Downstream consumers** that cannot tolerate partially-written or invalid data
+
+### Enabling WAP
+
+```python
+from quality.checker import no_nulls, min_row_count
+
+pipeline = Pipeline(
+    name="gold_revenue_wap",
+    source=TableConnector("silver.orders"),
+    transforms=["""
+        SELECT
+            order_date,
+            SUM(line_total) AS revenue
+        FROM {{input}}
+        GROUP BY order_date
+    """],
+    destination_name="daily_revenue",
+    destination_layer="gold",
+    wap_mode=True,  # <-- opt-in
+    quality_rules=[
+        no_nulls("order_date"),
+        min_row_count(1),
+    ],
+)
+```
+
+### What happens on failure
+
+```python
+runner = PipelineRunner()
+result = runner.run(pipeline)
+
+if result["status"] == "failed":
+    # Staging table still exists — inspect it
+    df = storage.conn.execute("SELECT * FROM staging.daily_revenue").fetchdf()
+    print(df)  # Debug the bad data
+```
+
+### WAP + incremental loading
+
+WAP works seamlessly with incremental loads. The delta is written to staging, checked, then published via `MERGE INTO`:
+
+```python
+pipeline = Pipeline(
+    name="orders_wap_incremental",
+    source=PostgresConnector(PG_CONN, "SELECT * FROM orders"),
+    transforms=["SELECT * FROM {{input}}"],
+    destination_name="orders",
+    destination_layer="bronze",
+    wap_mode=True,
+    incremental=IncrementalConfig(
+        cursor_column="order_date",
+        merge_keys=["order_id"],
+    ),
+    quality_rules=[no_nulls("order_id")],
+)
+```
+
+---
+
 ## 7. Available Connectors
+
+---
+
+## 8. Available Connectors
 
 | Connector | Use case | Example |
 |-----------|----------|---------|
@@ -340,7 +422,7 @@ All connectors implement:
 
 ---
 
-## 8. REST API
+## 9. REST API
 
 Start the API server:
 
@@ -370,7 +452,27 @@ curl -X POST "http://localhost:8000/run" \
     "source_config": {"path": "data/products.csv"},
     "transforms": ["SELECT * FROM {{input}}"],
     "destination_name": "products",
-    "destination_layer": "bronze"
+    "destination_layer": "bronze",
+    "wap_mode": false
+  }'
+```
+
+### WAP via API
+
+```bash
+curl -X POST "http://localhost:8000/run" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "api_wap_demo",
+    "source_type": "csv",
+    "source_config": {"path": "data/products.csv"},
+    "transforms": ["SELECT * FROM {{input}}"],
+    "destination_name": "products",
+    "destination_layer": "bronze",
+    "wap_mode": true,
+    "quality_rules": [
+      {"name": "min_row_count", "sql": "SELECT COUNT(*) >= 1 AS passed", "blocking": true}
+    ]
   }'
 ```
 
@@ -382,10 +484,10 @@ curl "http://localhost:8000/datasets/gold/daily_category_revenue/preview?limit=5
 
 ---
 
-## 9. Testing
+## 10. Testing
 
 ```bash
-# Run all tests (~80+)
+# Run all tests (~100)
 uv run pytest -v
 
 # Run specific test modules
@@ -399,14 +501,14 @@ uv run pytest -k incremental -v
 
 ---
 
-## 10. Project Structure Cheat Sheet
+## 11. Project Structure Cheat Sheet
 
 ```
 duckle/
 ├── src/
 │   ├── connectors/          # Extract (CSV, Postgres, Table)
 │   ├── engine/              # Transform (SQL step runner)
-│   ├── storage/             # Load (DuckLake bronze/silver/gold)
+│   ├── storage/             # Load (DuckLake bronze/silver/gold/staging)
 │   ├── orchestrator/        # Pipeline + PipelineRunner
 │   ├── quality/             # Data quality rules
 │   ├── api/                 # FastAPI REST server
@@ -420,7 +522,7 @@ duckle/
 
 ---
 
-## 11. Safety & SQL Injection Defence
+## 12. Safety & SQL Injection Defence
 
 Duckle takes SQL injection seriously:
 
@@ -433,7 +535,7 @@ Never interpolate identifiers directly into SQL strings. If you extend the codeb
 
 ---
 
-## 12. Common Patterns
+## 13. Common Patterns
 
 ### Cross-layer JOIN (Silver → Gold)
 
@@ -457,6 +559,31 @@ Pipeline(
 )
 ```
 
+### Write-Audit-Publish (WAP) with failure recovery
+
+```python
+pipeline = Pipeline(
+    name="critical_gold_metric",
+    source=TableConnector("silver.orders"),
+    transforms=["SELECT order_date, SUM(amount) AS revenue FROM {{input}} GROUP BY order_date"],
+    destination_name="daily_revenue",
+    destination_layer="gold",
+    wap_mode=True,
+    quality_rules=[
+        no_nulls("order_date"),
+        min_row_count(1),
+    ],
+)
+
+result = runner.run(pipeline)
+
+if result["status"] == "failed":
+    # Inspect staging table before fixing upstream data
+    bad_data = storage.conn.execute("SELECT * FROM staging.daily_revenue").fetchdf()
+    print("Quality failed. Staging data:", bad_data)
+    # Fix upstream, then re-run
+```
+
 ### Preview before writing
 
 ```python
@@ -476,11 +603,12 @@ print(conn.execute(f"SELECT * FROM {result} LIMIT 5").fetchdf())
 
 ## Next Steps
 
-1. **Modify a demo script:** Edit `scripts/example_csv.py` and add a new gold-layer aggregation.
-2. **Add a custom quality rule:** Extend `quality/checker.py` with a domain-specific check.
-3. **Connect your own Postgres:** Replace the Docker connection string with your own database.
-4. **Build a new connector:** Implement `BaseConnector` for an API or cloud storage source.
-5. **Schedule pipelines:** Call the `/run` API from cron, Airflow, or your scheduler of choice.
+1. **Try WAP mode:** Edit a demo script and add `wap_mode=True` + a quality rule that fails. Inspect the staging table.
+2. **Modify a demo script:** Edit `scripts/example_csv.py` and add a new gold-layer aggregation.
+3. **Add a custom quality rule:** Extend `quality/checker.py` with a domain-specific check.
+4. **Connect your own Postgres:** Replace the Docker connection string with your own database.
+5. **Build a new connector:** Implement `BaseConnector` for an API or cloud storage source.
+6. **Schedule pipelines:** Call the `/run` API from cron, Airflow, or your scheduler of choice.
 
 ---
 

@@ -36,6 +36,7 @@ class RunPipelineRequest(BaseModel):
     source_config: dict
     incremental: Optional[IncrementalConfigModel] = None
     quality_rules: Optional[list[dict]] = None
+    wap_mode: bool = False
 
 
 class RunStatus(BaseModel):
@@ -136,6 +137,7 @@ def run_pipeline(req: RunPipelineRequest, full_refresh: bool = False):
             source=connector,
             incremental=incremental,
             quality_rules=quality_rules,
+            wap_mode=req.wap_mode,
         )
         result = runner.run(pipeline, full_refresh=full_refresh)
         return result

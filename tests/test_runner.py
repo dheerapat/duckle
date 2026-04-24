@@ -215,6 +215,162 @@ class TestPipelineRunner:
                 destination_name="out",
             )
 
+    def test_wap_mode_success(self, ducklake_storage, sample_csv):
+        pipeline = Pipeline(
+            name="wap_success",
+            source=CSVConnector(sample_csv),
+            transforms=["SELECT * FROM {{input}}"],
+            destination_name="wap_out",
+            destination_layer="gold",
+            wap_mode=True,
+            quality_rules=[min_row_count(1)],
+        )
+        runner = PipelineRunner(storage=ducklake_storage)
+        result = runner.run(pipeline)
+
+        assert result["status"] == "success"
+        # Destination should exist
+        df = ducklake_storage.read("wap_out", "gold").fetchdf()
+        assert len(df) == 5
+        # Staging should be cleaned up
+        conn = ducklake_storage.conn
+        row = conn.execute(
+            "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'staging' AND table_name = 'wap_out'"
+        ).fetchone()
+        assert row[0] == 0
+
+    def test_wap_mode_failure_leaves_staging(self, ducklake_storage, sample_csv):
+        pipeline = Pipeline(
+            name="wap_fail",
+            source=CSVConnector(sample_csv),
+            transforms=["SELECT * FROM {{input}}"],
+            destination_name="wap_fail_out",
+            destination_layer="gold",
+            wap_mode=True,
+            quality_rules=[min_row_count(9999)],  # impossible
+        )
+        runner = PipelineRunner(storage=ducklake_storage)
+        result = runner.run(pipeline)
+
+        assert result["status"] == "failed"
+        assert "Quality checks failed" in result["error"]
+
+        # Destination should NOT exist
+        conn = ducklake_storage.conn
+        row = conn.execute(
+            "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'gold' AND table_name = 'wap_fail_out'"
+        ).fetchone()
+        assert row[0] == 0
+
+        # Staging should remain for inspection
+        row = conn.execute(
+            "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'staging' AND table_name = 'wap_fail_out'"
+        ).fetchone()
+        assert row[0] == 1
+
+    def test_wap_mode_incremental(self, ducklake_storage):
+        conn = ducklake_storage.conn
+        conn.execute(
+            "CREATE TABLE src_orders AS SELECT * FROM (VALUES (1, 100, '2024-01-01'), (2, 200, '2024-01-02')) t(order_id, amount, order_date)"
+        )
+
+        pipeline = Pipeline(
+            name="wap_inc",
+            source=TableConnector("src_orders"),
+            transforms=["SELECT * FROM {{input}}"],
+            destination_name="wap_inc_out",
+            destination_layer="gold",
+            incremental=IncrementalConfig(
+                cursor_column="order_date",
+                merge_keys=["order_id"],
+            ),
+            wap_mode=True,
+        )
+        runner = PipelineRunner(storage=ducklake_storage)
+        result = runner.run(pipeline)
+
+        assert result["status"] == "success"
+        df = ducklake_storage.read("wap_inc_out", "gold").fetchdf()
+        assert len(df) == 2
+
+        # Staging cleaned
+        row = conn.execute(
+            "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'staging' AND table_name = 'wap_inc_out'"
+        ).fetchone()
+        assert row[0] == 0
+
+    def test_wap_mode_full_refresh(self, ducklake_storage, sample_csv):
+        pipeline = Pipeline(
+            name="wap_full",
+            source=CSVConnector(sample_csv),
+            transforms=["SELECT * FROM {{input}}"],
+            destination_name="wap_full_out",
+            destination_layer="gold",
+            wap_mode=True,
+        )
+        runner = PipelineRunner(storage=ducklake_storage)
+        result = runner.run(pipeline, full_refresh=True)
+
+        assert result["status"] == "success"
+        df = ducklake_storage.read("wap_full_out", "gold").fetchdf()
+        assert len(df) == 5
+
+        # Staging cleaned
+        conn = ducklake_storage.conn
+        row = conn.execute(
+            "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'staging' AND table_name = 'wap_full_out'"
+        ).fetchone()
+        assert row[0] == 0
+
+    def test_wap_mode_non_blocking_quality(self, ducklake_storage, sample_csv):
+        from quality.checker import QualityRule
+
+        pipeline = Pipeline(
+            name="wap_nb",
+            source=CSVConnector(sample_csv),
+            transforms=["SELECT * FROM {{input}}"],
+            destination_name="wap_nb_out",
+            destination_layer="gold",
+            wap_mode=True,
+            quality_rules=[
+                QualityRule(
+                    name="always_fail",
+                    sql="SELECT FALSE AS passed",
+                    description="fails but non-blocking",
+                    blocking=False,
+                ),
+                min_row_count(1),
+            ],
+        )
+        runner = PipelineRunner(storage=ducklake_storage)
+        result = runner.run(pipeline)
+
+        assert result["status"] == "success"
+        df = ducklake_storage.read("wap_nb_out", "gold").fetchdf()
+        assert len(df) == 5
+
+    def test_wap_mode_backward_compat(self, ducklake_storage, sample_csv):
+        pipeline = Pipeline(
+            name="wap_compat",
+            source=CSVConnector(sample_csv),
+            transforms=["SELECT * FROM {{input}}"],
+            destination_name="wap_compat_out",
+            destination_layer="gold",
+            # wap_mode defaults to False
+        )
+        runner = PipelineRunner(storage=ducklake_storage)
+        result = runner.run(pipeline)
+
+        assert result["status"] == "success"
+        df = ducklake_storage.read("wap_compat_out", "gold").fetchdf()
+        assert len(df) == 5
+
+        conn = ducklake_storage.conn
+        row = conn.execute(
+            "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'staging' AND table_name = 'wap_compat_out'"
+        ).fetchone()
+        assert row[0] == 0
+
 
 class TestIncrementalPipeline:
     def test_incremental_first_run_fallback(self, ducklake_storage):

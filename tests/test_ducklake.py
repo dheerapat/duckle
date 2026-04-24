@@ -147,3 +147,79 @@ class TestDuckLakeStorage:
         state = ducklake_storage.get_pipeline_state("meta_merge", "gold")
         assert state["merge_keys"] == "id,val"
         assert state["run_mode"] == "incremental"
+
+    def test_publish_full_replace(self, ducklake_storage):
+        conn = ducklake_storage.conn
+        conn.execute("CREATE TABLE staging_src AS SELECT 1 AS id, 10 AS val")
+        ducklake_storage.write("staging_src", name="pub_ds", layer="staging", track_metadata=False)
+
+        ducklake_storage.publish(
+            staging_name="pub_ds",
+            name="pub_dest",
+            layer="gold",
+            merge_keys=None,
+        )
+
+        df = ducklake_storage.read("pub_dest", "gold").fetchdf()
+        assert len(df) == 1
+        assert df.iloc[0]["val"] == 10
+
+        # Staging should be dropped
+        row = conn.execute(
+            "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'staging' AND table_name = 'pub_ds'"
+        ).fetchone()
+        assert row[0] == 0
+
+    def test_publish_merge(self, ducklake_storage):
+        conn = ducklake_storage.conn
+        conn.execute("CREATE TABLE dest AS SELECT 1 AS id, 10 AS val")
+        ducklake_storage.write("dest", name="pub_merge", layer="gold")
+
+        conn.execute("CREATE TABLE staging_src AS SELECT * FROM (VALUES (1, 99), (2, 20)) t(id, val)")
+        ducklake_storage.write("staging_src", name="pub_merge", layer="staging", track_metadata=False)
+
+        ducklake_storage.publish(
+            staging_name="pub_merge",
+            name="pub_merge",
+            layer="gold",
+            merge_keys=["id"],
+        )
+
+        df = ducklake_storage.read("pub_merge", "gold").fetchdf()
+        assert len(df) == 2
+        assert df[df["id"] == 1]["val"].iloc[0] == 99
+        assert df[df["id"] == 2]["val"].iloc[0] == 20
+
+        # Staging should be dropped
+        row = conn.execute(
+            "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'staging' AND table_name = 'pub_merge'"
+        ).fetchone()
+        assert row[0] == 0
+
+    def test_publish_merge_fallback(self, ducklake_storage):
+        conn = ducklake_storage.conn
+        conn.execute("CREATE TABLE staging_src AS SELECT 1 AS id, 10 AS val")
+        ducklake_storage.write("staging_src", name="pub_fallback", layer="staging", track_metadata=False)
+
+        # Destination does not exist — publish with merge_keys should fall back to CREATE OR REPLACE
+        ducklake_storage.publish(
+            staging_name="pub_fallback",
+            name="pub_fallback_dest",
+            layer="gold",
+            merge_keys=["id"],
+        )
+
+        df = ducklake_storage.read("pub_fallback_dest", "gold").fetchdf()
+        assert len(df) == 1
+
+    def test_drop_staging(self, ducklake_storage):
+        conn = ducklake_storage.conn
+        conn.execute("CREATE TABLE src AS SELECT 1 AS id")
+        ducklake_storage.write("src", name="drop_me", layer="staging", track_metadata=False)
+
+        ducklake_storage.drop_staging("drop_me")
+
+        row = conn.execute(
+            "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'staging' AND table_name = 'drop_me'"
+        ).fetchone()
+        assert row[0] == 0

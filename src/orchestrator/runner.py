@@ -45,6 +45,7 @@ class Pipeline:
         source: Optional[BaseConnector] = None,
         sources: Optional[dict[str, BaseConnector]] = None,
         incremental: Optional[IncrementalConfig] = None,
+        wap_mode: bool = False,
     ):
         if source is not None and sources is not None:
             raise ValueError("Provide only one of 'source' or 'sources'")
@@ -57,6 +58,7 @@ class Pipeline:
         self.destination_layer = destination_layer
         self.quality_rules = quality_rules or []
         self.incremental = incremental
+        self.wap_mode = wap_mode
         self.sources: dict[str, BaseConnector]
 
         if incremental is not None:
@@ -155,35 +157,69 @@ class PipelineRunner:
             for i in range(len(pipeline.transforms)):
                 intermediate_tables.append(f"_transform_step_{i}")
 
-            # 3. QUALITY CHECKS
+            # 3. WRITE (staging when WAP, else direct)
+            if pipeline.wap_mode:
+                print("\n[3/4] Writing to staging...")
+                self.storage.write(
+                    final_table,
+                    name=pipeline.destination_name,
+                    layer="staging",
+                    pipeline=pipeline.name,
+                    track_metadata=False,
+                )
+                quality_table = pipeline.destination_name
+                quality_schema = "staging"
+            else:
+                quality_table = final_table
+
+            # 4. QUALITY CHECKS
             if pipeline.quality_rules:
-                print("\n[3/4] Running quality checks...")
+                print("\n[4/4] Running quality checks...")
                 checker = QualityChecker(conn)
-                result = checker.check(final_table, pipeline.quality_rules)
+                result = checker.check(quality_table, pipeline.quality_rules, schema=quality_schema if pipeline.wap_mode else None)
                 run["quality"] = result["results"]
                 if not result["passed"]:
                     raise ValueError("Quality checks failed — pipeline aborted.")
             else:
-                print("\n[3/4] No quality rules defined, skipping.")
+                print("\n[4/4] No quality rules defined, skipping.")
 
-            # 4. LOAD
-            print("\n[4/4] Loading to DuckLake...")
-            if run_mode == "incremental" and since_value is not None:
-                assert pipeline.incremental is not None
-                self.storage.merge(
-                    final_table,
-                    name=pipeline.destination_name,
-                    layer=pipeline.destination_layer,
-                    merge_keys=pipeline.incremental.merge_keys,
-                    pipeline=pipeline.name,
-                )
+            # 5. LOAD / PUBLISH
+            print("\n[5/5] Loading to DuckLake..." if pipeline.wap_mode else "\n[4/4] Loading to DuckLake...")
+            if pipeline.wap_mode:
+                if run_mode == "incremental" and since_value is not None:
+                    assert pipeline.incremental is not None
+                    self.storage.publish(
+                        staging_name=pipeline.destination_name,
+                        name=pipeline.destination_name,
+                        layer=pipeline.destination_layer,
+                        merge_keys=pipeline.incremental.merge_keys,
+                        pipeline=pipeline.name,
+                    )
+                else:
+                    self.storage.publish(
+                        staging_name=pipeline.destination_name,
+                        name=pipeline.destination_name,
+                        layer=pipeline.destination_layer,
+                        merge_keys=None,
+                        pipeline=pipeline.name,
+                    )
             else:
-                self.storage.write(
-                    final_table,
-                    name=pipeline.destination_name,
-                    layer=pipeline.destination_layer,
-                    pipeline=pipeline.name,
-                )
+                if run_mode == "incremental" and since_value is not None:
+                    assert pipeline.incremental is not None
+                    self.storage.merge(
+                        final_table,
+                        name=pipeline.destination_name,
+                        layer=pipeline.destination_layer,
+                        merge_keys=pipeline.incremental.merge_keys,
+                        pipeline=pipeline.name,
+                    )
+                else:
+                    self.storage.write(
+                        final_table,
+                        name=pipeline.destination_name,
+                        layer=pipeline.destination_layer,
+                        pipeline=pipeline.name,
+                    )
 
             run["status"] = "success"
             print(f"\n✅ Pipeline '{pipeline.name}' completed successfully.")

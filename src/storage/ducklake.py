@@ -23,7 +23,7 @@ class DuckLakeStorage:
     Supports Bronze / Silver / Gold layers as schemas.
     """
 
-    LAYERS = ["bronze", "silver", "gold"]
+    LAYERS = ["bronze", "silver", "gold", "staging"]
 
     def __init__(self):
         self.catalog_path = os.environ.get(
@@ -65,7 +65,7 @@ class DuckLakeStorage:
         )
         conn.execute("USE ducklake")
 
-        # Create layer schemas
+        # Create layer schemas (including staging for WAP)
         for layer in self.LAYERS:
             conn.execute(f"CREATE SCHEMA IF NOT EXISTS {layer}")
 
@@ -106,6 +106,7 @@ class DuckLakeStorage:
         name: str,
         layer: str = "gold",
         pipeline: Optional[str] = None,
+        track_metadata: bool = True,
     ) -> str:
         """
         Write a DuckDB table into a DuckLake layer.
@@ -132,6 +133,94 @@ class DuckLakeStorage:
         )
 
         now = datetime.now(timezone.utc)
+        if track_metadata:
+            self._meta_conn.execute(
+                """
+                INSERT OR REPLACE INTO _metadata
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    f"{layer}/{safe_name}",
+                    safe_name,
+                    layer,
+                    count,
+                    now,
+                    pipeline,
+                    None,
+                    None,
+                    None,
+                    "full",
+                ],
+            )
+            self._meta_conn.commit()
+
+        print(f"[DuckLake] Written {count} rows → {layer}.{safe_name}")
+        return f"{layer}.{safe_name}"
+
+    def publish(
+        self,
+        staging_name: str,
+        name: str,
+        layer: str,
+        merge_keys: list[str] | None = None,
+        pipeline: Optional[str] = None,
+    ) -> str:
+        """Publish a staging table to its destination layer.
+
+        * merge_keys is None  → CREATE OR REPLACE TABLE (full publish).
+        * merge_keys provided → MERGE INTO (incremental publish).
+        After successful publish the staging table is dropped.
+        """
+        assert layer in self.LAYERS, f"Layer must be one of {self.LAYERS}"
+
+        safe_staging = safe_identifier(staging_name, label="staging name")
+        safe_name = safe_identifier(name, label="dataset name")
+        staging_table = f"staging.{safe_staging}"
+        dest = f"{layer}.{safe_name}"
+
+        row = self.conn.execute(
+            "SELECT COUNT(*) FROM information_schema.tables "
+            "WHERE table_schema = ? AND table_name = ?",
+            [layer, safe_name],
+        ).fetchone()
+        assert row is not None
+        exists = row[0]
+
+        if merge_keys is None or not exists:
+            self.conn.execute(
+                f"CREATE OR REPLACE TABLE {dest} AS SELECT * FROM {staging_table}"
+            )
+        else:
+            on_clause = " AND ".join(
+                f"dest.{safe_identifier(k, label='merge key')} = src.{safe_identifier(k, label='merge key')}"
+                for k in merge_keys
+            )
+            self.conn.execute(f"""
+                MERGE INTO {dest} AS dest
+                USING {staging_table} AS src
+                ON ({on_clause})
+                WHEN MATCHED THEN UPDATE SET *
+                WHEN NOT MATCHED THEN INSERT *
+            """)
+
+        result = self.conn.execute(f"SELECT COUNT(*) FROM {dest}").fetchone()
+        count = result[0] if result is not None else 0
+
+        # Drop staging table after successful publish
+        self.conn.execute(f"DROP TABLE IF EXISTS {staging_table}")
+
+        now = datetime.now(timezone.utc)
+        merge_keys_str = ",".join(merge_keys) if merge_keys else None
+        run_mode = "incremental" if merge_keys else "full"
+
+        # Preserve existing cursor metadata
+        existing = self._meta_conn.execute(
+            "SELECT cursor_column, last_cursor_value FROM _metadata WHERE id = ?",
+            [f"{layer}/{safe_name}"],
+        ).fetchone()
+        cursor_column = existing[0] if existing is not None else None
+        last_cursor_value = existing[1] if existing is not None else None
+
         self._meta_conn.execute(
             """
             INSERT OR REPLACE INTO _metadata
@@ -144,16 +233,21 @@ class DuckLakeStorage:
                 count,
                 now,
                 pipeline,
-                None,
-                None,
-                None,
-                "full",
+                cursor_column,
+                last_cursor_value,
+                merge_keys_str,
+                run_mode,
             ],
         )
         self._meta_conn.commit()
 
-        print(f"[DuckLake] Written {count} rows → {layer}.{safe_name}")
-        return f"{layer}.{safe_name}"
+        print(f"[DuckLake] Published {count} rows from staging → {dest}")
+        return dest
+
+    def drop_staging(self, name: str) -> None:
+        """Drop a table from the staging schema."""
+        safe_name = safe_identifier(name, label="staging name")
+        self.conn.execute(f"DROP TABLE IF EXISTS staging.{safe_name}")
 
     def merge(
         self,
